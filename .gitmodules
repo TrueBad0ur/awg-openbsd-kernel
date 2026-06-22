@@ -1,0 +1,6 @@
+[submodule "dependencies/amneziawg-go"]
+	path = dependencies/amneziawg-go
+	url = git@github.com:TrueBad0ur/amneziawg-go.git
+[submodule "dependencies/amneziawg-tools"]
+	path = dependencies/amneziawg-tools
+	url = git@github.com:TrueBad0ur/amneziawg-tools.git

@@ -1,0 +1,17 @@
+# Sensitive configs (may contain private keys / PSK)
+*.conf
+
+# Kernel build artifacts
+*.orig
+*.debug
+*.o
+awgtest
+awgtest.c
+
+# Old intermediate diffs (superseded by awg-openbsd.patch)
+awgmp.diff
+conf_files.diff
+
+# Misc
+ktrace.out
+*.out
