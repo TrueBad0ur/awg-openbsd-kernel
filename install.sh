@@ -48,7 +48,8 @@ install_kernel_packages() {
     step "Kernel build packages"
 
     # kernel sources — needed to build AWG.MP
-    if [ ! -f "$SRCDIR/net/if_wg.c" ]; then
+    # Also check files.rasops as a sentinel for a complete (non-corrupt) extraction
+    if [ ! -f "$SRCDIR/net/if_wg.c" ] || [ ! -s "$SRCDIR/dev/rasops/files.rasops" ]; then
         local ver mirror url
         ver=$(uname -r)
         mirror="https://cdn.openbsd.org/pub/OpenBSD/${ver}"
