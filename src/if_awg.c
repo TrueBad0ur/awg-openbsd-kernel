@@ -1,8 +1,13 @@
-/*	$OpenBSD: if_wg.c,v 1.48 2026/04/13 01:10:39 dlg Exp $ */
+/*	$OpenBSD: if_awg.c,v 1.0 2026/06/22 00:00:00 arekhov Exp $ */
 
 /*
+ * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
  * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  * Copyright (C) 2019-2020 Matt Dunwoodie <ncon@noconroy.net>
+ *
+ * AmneziaWG kernel driver for OpenBSD.
+ * Based on if_wg.c (WireGuard driver) from OpenBSD src/sys/net/.
+ * Adds obfuscation parameters: Jc, Jmin, Jmax, S1, S2, H1-H4.
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above

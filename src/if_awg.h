@@ -1,10 +1,24 @@
 /*
- * AmneziaWG for OpenBSD — kernel driver public interface.
- * Based on if_wg.h by Jason A. Donenfeld and Matt Dunwoodie.
+ * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
+ * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+ * Copyright (C) 2019-2020 Matt Dunwoodie <ncon@noconroy.net>
  *
- * Designed to be used by tools such as ifconfig(8) and awg(8).
+ * AmneziaWG kernel driver public interface for OpenBSD.
+ * Based on if_wg.h from OpenBSD src/sys/net/.
  * Interface: awg0, awg1, ...
  * Ioctls: SIOCSAWG (212), SIOCGAWG (213)
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
 #ifndef __IF_AWG_H__
