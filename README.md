@@ -27,7 +27,7 @@ Interfaces are named `awg0`, `awg1`, … Configs live in `/etc/amnezia/amneziawg
 
 ```sh
 # Clone the repo with submodules
-git clone --recurse-submodules https://github.com/your-user/awg-openbsd
+git clone --recurse-submodules https://github.com/TrueBad0ur/awg-openbsd-kernel
 cd awg-openbsd
 
 # 1. Build and install awg + awg-quick tools (fast, no reboot)
