@@ -49,9 +49,19 @@ install_kernel_packages() {
 
     # kernel sources — needed to build AWG.MP
     if [ ! -f "$SRCDIR/net/if_wg.c" ]; then
-        log "Installing kernel sources"
-        pkg_add kernel-sources
-        [ -f "$SRCDIR/net/if_wg.c" ] || die "kernel-sources installed but $SRCDIR/net/if_wg.c not found"
+        local ver mirror
+        ver=$(uname -r)
+        mirror="https://cdn.openbsd.org/pub/OpenBSD/${ver}"
+        log "Fetching sys.tgz (kernel sources) from $mirror"
+        mkdir -p /usr/src
+        ftp -o /tmp/sys.tgz "${mirror}/sys.tgz" \
+            || die "Failed to download sys.tgz from $mirror"
+        tar -C /usr/src -xzf /tmp/sys.tgz \
+            || die "Failed to extract sys.tgz"
+        rm -f /tmp/sys.tgz
+        [ -f "$SRCDIR/net/if_wg.c" ] \
+            || die "sys.tgz extracted but $SRCDIR/net/if_wg.c not found — wrong OpenBSD version?"
+        log "Kernel sources installed to /usr/src"
     fi
 
     # python3 — used to patch conf/files idempotently
