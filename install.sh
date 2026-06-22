@@ -49,18 +49,22 @@ install_kernel_packages() {
 
     # kernel sources — needed to build AWG.MP
     if [ ! -f "$SRCDIR/net/if_wg.c" ]; then
-        local ver mirror
+        local ver mirror url
         ver=$(uname -r)
         mirror="https://cdn.openbsd.org/pub/OpenBSD/${ver}"
-        log "Fetching sys.tgz (kernel sources) from $mirror"
+        url="${mirror}/sys.tar.gz"
+        log "Fetching kernel sources from $url"
+        # Verify the file exists before downloading
+        ftp -o /dev/null "$url" 2>/dev/null \
+            || die "Kernel sources not found at $url — CDN only carries 7.7+. For older versions, download sys.tar.gz manually from a mirror and extract to /usr/src"
         mkdir -p /usr/src
-        ftp -o /tmp/sys.tgz "${mirror}/sys.tgz" \
-            || die "Failed to download sys.tgz from $mirror"
-        tar -C /usr/src -xzf /tmp/sys.tgz \
-            || die "Failed to extract sys.tgz"
-        rm -f /tmp/sys.tgz
+        ftp -o /tmp/sys.tar.gz "$url" \
+            || die "Failed to download sys.tar.gz"
+        tar -C /usr/src -xzf /tmp/sys.tar.gz \
+            || die "Failed to extract sys.tar.gz"
+        rm -f /tmp/sys.tar.gz
         [ -f "$SRCDIR/net/if_wg.c" ] \
-            || die "sys.tgz extracted but $SRCDIR/net/if_wg.c not found — wrong OpenBSD version?"
+            || die "sys.tar.gz extracted but $SRCDIR/net/if_wg.c not found"
         log "Kernel sources installed to /usr/src"
     fi
 
