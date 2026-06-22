@@ -1,3 +1,5 @@
+/*	$OpenBSD: if_awg.h,v 1.0 2026/06/22 00:00:00 arekhov Exp $ */
+
 /*
  * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
  * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
