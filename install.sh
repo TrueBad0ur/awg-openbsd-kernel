@@ -84,6 +84,10 @@ fetch_submodules() {
     cd "$REPODIR"
 
     if [ -d "$REPODIR/.git" ]; then
+        # Allow git to operate in this repo regardless of directory ownership
+        git config --global --add safe.directory "$REPODIR"
+        git config --global --add safe.directory "$DEPSDIR/amneziawg-tools"
+        git config --global --add safe.directory "$DEPSDIR/amneziawg-go"
         if [ ! -f "$DEPSDIR/amneziawg-tools/src/Makefile" ]; then
             log "Initialising submodules"
             git submodule update --init --recursive
