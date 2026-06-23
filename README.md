@@ -167,6 +167,37 @@ make -j$(sysctl -n hw.ncpu) && make install
 reboot
 ```
 
+## Performance
+
+Benchmarked on OpenBSD 7.9, AMD Ryzen 7 5800H, loopback (two interfaces on the same machine):
+
+| Configuration | Throughput (single stream) | Throughput (4 streams) |
+|---|---|---|
+| WireGuard `wg(4)` baseline | 26.8 Gbps | 56.3 Gbps |
+| AWG — no obfuscation | 27.9 Gbps | 56.0 Gbps |
+| AWG — full obfuscation (Jc=4, S1=26, S2=33, custom H1–H4) | 26.9 Gbps | 56.3 Gbps |
+| AWG — 30 AllowedIPs entries | 27.7 Gbps | — |
+
+**AWG obfuscation adds zero measurable overhead on the data path.** The obfuscation parameters (junk packets, prefix bytes, magic headers) only affect handshake packets, not data encryption. AllowedIPs lookups use an ART (Allotment Routing Table) with O(prefix length) complexity, so the number of entries does not affect throughput or latency.
+
+Real-world tunnel to a remote peer (~37 ms RTT), measured with `curl` against Cloudflare:
+
+| Direction | Speed |
+|---|---|
+| Download | 61.7 Mbit/s |
+| Upload | 78.0 Mbit/s |
+| Latency | ~20 ms |
+
+These numbers are limited by the peer's bandwidth and the RTT, not the driver.
+
+## Why not just use the original AmneziaWG driver?
+
+On **FreeBSD**, you can — there is an official `amnezia-kmod` package that installs a pre-built loadable kernel module (`if_amn.ko`), loaded at runtime via `kldload` without any reboot. See [freebsd-amneziawg-setup](https://github.com/HugoFiermein/freebsd-amneziawg-setup) for a ready-made installer.
+
+On **OpenBSD**, this is not possible. OpenBSD does not support loadable kernel modules for network drivers — the kernel is monolithic and all pseudo-devices must be compiled in. The upstream `wg(4)` driver is compiled directly into `GENERIC`, not shipped as a `.ko`. There is no AmneziaWG package for OpenBSD and no shortcut: the only way is to fork `if_wg.c`, extend it with AWG obfuscation, and build a custom kernel. That is exactly what this project does.
+
+As of 2026, **this is the only native kernel-level AmneziaWG implementation for OpenBSD**. The only prior alternative was the userspace daemon `amneziawg-go`, which trades kernel performance for portability.
+
 ## Repo layout
 
 ```
