@@ -69,11 +69,6 @@ install_kernel_packages() {
         log "Kernel sources installed to /usr/src"
     fi
 
-    # python3 — used to patch conf/files idempotently
-    if ! command -v python3 >/dev/null 2>&1; then
-        log "Installing python3"; pkg_add python3
-    fi
-
     log "Kernel packages OK"
 }
 
@@ -144,22 +139,14 @@ install_kernel() {
         log "conf/files already patched"
     else
         log "Patching $SRCDIR/conf/files"
-        python3 - <<'PYEOF'
-path = "/usr/src/sys/conf/files"
-with open(path) as f:
-    c = f.read()
-c = c.replace(
-    "pseudo-device wg: ifnet\n",
-    "pseudo-device wg: ifnet\npseudo-device awg: ifnet\n"
-)
-c = c.replace(
-    "file net/if_wg.c\t\t\twg\n",
-    "file net/if_wg.c\t\t\twg\nfile net/if_awg.c\t\t\tawg\n"
-)
-assert "pseudo-device awg" in c, "patch failed — wg entry not found in conf/files"
-with open(path, "w") as f:
-    f.write(c)
-PYEOF
+        awk '
+            /^pseudo-device wg: ifnet$/ { print; print "pseudo-device awg: ifnet"; next }
+            /^file net\/if_wg\.c/ { print; print "file net/if_awg.c\t\t\tawg"; next }
+            { print }
+        ' "$SRCDIR/conf/files" > "$SRCDIR/conf/files.tmp" \
+            && mv "$SRCDIR/conf/files.tmp" "$SRCDIR/conf/files"
+        grep -q 'pseudo-device awg' "$SRCDIR/conf/files" \
+            || die "conf/files patch failed — wg entry not found"
     fi
 
     # Generate kernel build directory

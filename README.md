@@ -20,7 +20,7 @@ Interfaces are named `awg0`, `awg1`, … Configs live in `/etc/amnezia/amneziawg
 
 - OpenBSD 7.x amd64
 - Root access
-- Kernel sources at `/usr/src/sys/` (`pkg_add kernel-sources`)
+- Kernel sources at `/usr/src/sys/` — `install.sh` downloads `sys.tar.gz` from the OpenBSD CDN automatically if missing
 - Packages: `bash`, `coreutils` (ginstall), `gmake` — `install.sh` installs them automatically
 
 ## Installation
@@ -28,7 +28,7 @@ Interfaces are named `awg0`, `awg1`, … Configs live in `/etc/amnezia/amneziawg
 ```sh
 # Clone the repo with submodules
 git clone --recurse-submodules https://github.com/TrueBad0ur/awg-openbsd-kernel
-cd awg-openbsd
+cd awg-openbsd-kernel
 
 # 1. Build and install awg + awg-quick tools (fast, no reboot)
 doas sh install.sh --tools-only
