@@ -118,6 +118,25 @@ Add to `/etc/rc.local`:
 awg-quick up myvpn
 ```
 
+### TCP MSS clamping
+
+`awg-quick` does not configure TCP MSS clamping automatically (unlike Linux `wg-quick`). Without it, TCP packets may exceed the tunnel MTU and get fragmented.
+
+`install.sh` adds the following rule to `/etc/pf.conf` automatically:
+
+```
+match on awg scrub (max-mss 1380)
+```
+
+The value 1380 = tunnel MTU (1420) − IP header (20) − TCP header (20).
+
+If you installed the tools manually, add this rule yourself and reload pf:
+
+```sh
+echo 'match on awg scrub (max-mss 1380)' >> /etc/pf.conf
+pfctl -f /etc/pf.conf
+```
+
 ## AWG obfuscation parameters
 
 | Param | Meaning | Default (= plain WireGuard) |

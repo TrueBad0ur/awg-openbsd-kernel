@@ -187,6 +187,51 @@ setup_confdir() {
     fi
 }
 
+# ── 6. pf MSS clamping ────────────────────────────────────────────────────────
+
+setup_pf_mss() {
+    step "pf MSS clamping for awg interfaces"
+
+    local PF_CONF=/etc/pf.conf
+    local RULE='match on awg scrub (max-mss 1380)'
+
+    # awg-quick does not add MSS clamping automatically. Without it, TCP packets
+    # can exceed the tunnel MTU (1420) and get fragmented. The clamp ensures TCP
+    # MSS = 1420 - 20 (IP) - 20 (TCP) = 1380 on all awg* interfaces.
+
+    if grep -q 'max-mss.*1380' "$PF_CONF" 2>/dev/null; then
+        log "pf MSS clamp already present in $PF_CONF"
+        return
+    fi
+
+    if [ ! -f "$PF_CONF" ]; then
+        log "Creating $PF_CONF with MSS clamp rule"
+        printf 'set skip on lo\n\n# Clamp TCP MSS to awg MTU (1420 - 40 = 1380)\n%s\n\nblock return\npass\n' "$RULE" > "$PF_CONF"
+    else
+        log "Adding MSS clamp rule to $PF_CONF"
+        # Insert after the first 'set skip' line, or prepend if none found
+        if grep -q '^set skip' "$PF_CONF"; then
+            # Use awk to insert after the last 'set skip' line
+            awk -v rule="$RULE" '
+                /^set skip/ { print; found=1; next }
+                found && !/^set skip/ { print "\n# Clamp TCP MSS to awg MTU (1420 - 40 = 1380)"; print rule; found=0 }
+                { print }
+            ' "$PF_CONF" > "$PF_CONF.tmp" && mv "$PF_CONF.tmp" "$PF_CONF"
+        else
+            # Prepend to file
+            { printf '# Clamp TCP MSS to awg MTU (1420 - 40 = 1380)\n%s\n\n' "$RULE"; cat "$PF_CONF"; } > "$PF_CONF.tmp" \
+                && mv "$PF_CONF.tmp" "$PF_CONF"
+        fi
+    fi
+
+    # Validate and reload pf
+    if pfctl -nf "$PF_CONF" 2>/dev/null; then
+        pfctl -f "$PF_CONF" && log "pf reloaded with MSS clamp" || log "WARNING: pf reload failed — check $PF_CONF"
+    else
+        log "WARNING: pf syntax check failed — rule not loaded, check $PF_CONF manually"
+    fi
+}
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -223,6 +268,7 @@ case "$MODE" in
         fetch_submodules
         install_tools
         setup_confdir
+        setup_pf_mss
         ;;
     kernel)
         install_kernel_packages
@@ -234,6 +280,7 @@ case "$MODE" in
         fetch_submodules
         install_tools
         setup_confdir
+        setup_pf_mss
         install_kernel
         ;;
 esac
