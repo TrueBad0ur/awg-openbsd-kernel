@@ -3,16 +3,16 @@
 # Run as root on OpenBSD 7.x amd64
 #
 # Usage:
-#   sh install.sh --tools-only   # build awg + awg-quick (no reboot needed)
-#   sh install.sh --kernel-only  # build and install AWG kernel
+#   sh install.sh --tools-only   # patch + rebuild ifconfig, install awg-quick (no reboot)
+#   sh install.sh --kernel-only  # build and install AWG kernel (requires reboot)
 #   sh install.sh --all          # everything (default)
 
 set -e
 
 SCRIPT=$(readlink -f "$0")
 REPODIR=$(dirname "$SCRIPT")
-DEPSDIR="$REPODIR/dependencies"
 SRCDIR=/usr/src/sys
+IFCFG_SRC=/usr/src/sbin/ifconfig
 LOGFILE=/tmp/awg-install.log
 
 log()  { echo "==> $*"; echo "==> $*" >> "$LOGFILE"; }
@@ -28,107 +28,94 @@ check_root() {
 install_packages() {
     step "System packages"
 
-    if ! command -v git >/dev/null 2>&1; then
-        log "Installing git"; pkg_add git
-    fi
     if ! command -v bash >/dev/null 2>&1; then
         log "Installing bash"; pkg_add bash
-    fi
-    if ! command -v ginstall >/dev/null 2>&1; then
-        log "Installing coreutils (ginstall)"; pkg_add coreutils
-    fi
-    if ! command -v gmake >/dev/null 2>&1; then
-        log "Installing gmake"; pkg_add gmake
     fi
 
     log "Packages OK"
 }
 
-install_kernel_packages() {
-    step "Kernel build packages"
+# ── 2. Kernel sources ─────────────────────────────────────────────────────────
 
-    # kernel sources — needed to build AWG.MP
-    # Validate sources are not corrupted (files.rasops being all-zero is a known bad-extraction symptom)
+fetch_sys_sources() {
+    step "Kernel sources"
+
+    # Validate sources (files.rasops being empty is a known bad-extraction symptom)
     if [ ! -f "$SRCDIR/net/if_wg.c" ] || ! grep -q 'OpenBSD' "$SRCDIR/dev/rasops/files.rasops" 2>/dev/null; then
-        local ver mirror url
+        local ver url
         ver=$(uname -r)
-        mirror="https://cdn.openbsd.org/pub/OpenBSD/${ver}"
-        url="${mirror}/sys.tar.gz"
+        url="https://cdn.openbsd.org/pub/OpenBSD/${ver}/sys.tar.gz"
         log "Fetching kernel sources from $url"
-        # Verify the file exists before downloading
         ftp -o /dev/null "$url" 2>/dev/null \
-            || die "Kernel sources not found at $url — CDN only carries 7.7+. For older versions, download sys.tar.gz manually from a mirror and extract to /usr/src"
+            || die "sys.tar.gz not found at $url — CDN only carries 7.7+. Download manually and extract to /usr/src"
         mkdir -p /usr/src
-        ftp -o /tmp/sys.tar.gz "$url" \
-            || die "Failed to download sys.tar.gz"
-        tar -C /usr/src -xzf /tmp/sys.tar.gz \
-            || die "Failed to extract sys.tar.gz"
+        ftp -o /tmp/sys.tar.gz "$url" || die "Failed to download sys.tar.gz"
+        tar -C /usr/src -xzf /tmp/sys.tar.gz || die "Failed to extract sys.tar.gz"
         rm -f /tmp/sys.tar.gz
-        [ -f "$SRCDIR/net/if_wg.c" ] \
-            || die "sys.tar.gz extracted but $SRCDIR/net/if_wg.c not found"
-        log "Kernel sources installed to /usr/src"
-    fi
-
-    log "Kernel packages OK"
-}
-
-# ── 2. Submodules ─────────────────────────────────────────────────────────────
-
-fetch_submodules() {
-    step "Git submodules"
-
-    cd "$REPODIR"
-
-    if [ -d "$REPODIR/.git" ]; then
-        # Allow git to operate in this repo regardless of directory ownership
-        git config --global --add safe.directory "$REPODIR"
-        git config --global --add safe.directory "$DEPSDIR/amneziawg-tools"
-        if [ ! -f "$DEPSDIR/amneziawg-tools/src/Makefile" ]; then
-            log "Initialising submodules"
-            git submodule update --init --recursive
-        else
-            log "Updating submodules"
-            git submodule update --recursive
-        fi
+        [ -f "$SRCDIR/net/if_wg.c" ] || die "sys.tar.gz extracted but $SRCDIR/net/if_wg.c not found"
+        log "Kernel sources installed to /usr/src/sys"
     else
-        log "No .git found — skipping submodule update (run 'git submodule update --init --recursive' after git init)"
+        log "Kernel sources already present"
     fi
-
-    [ -f "$DEPSDIR/amneziawg-tools/src/Makefile" ] \
-        || die "amneziawg-tools not found at $DEPSDIR/amneziawg-tools/src/Makefile — populate submodules first"
-
-    log "Submodules OK"
 }
 
-# ── 3. amneziawg-tools (awg + awg-quick) ─────────────────────────────────────
+# ── 3. ifconfig patch ─────────────────────────────────────────────────────────
 
-install_tools() {
-    step "amneziawg-tools (awg + awg-quick)"
+install_ifconfig() {
+    step "ifconfig — AWG support patch"
 
-    cd "$DEPSDIR/amneziawg-tools/src"
-    gmake clean 2>/dev/null || true
-    gmake
-    # Install to /usr/bin so awg takes priority over any pre-existing /usr/local/bin binary
-    gmake install \
-        PREFIX=/usr \
-        WITH_WGQUICK=yes \
-        SYSCONFDIR=/etc
+    local PATCH="$REPODIR/sbin/ifconfig/ifconfig_awg.patch"
+    [ -f "$PATCH" ] || die "Patch not found: $PATCH"
 
-    # awg-quick is a bash script — fix shebang if needed
-    if ! head -1 /usr/bin/awg-quick | grep -q bash; then
-        log "Fixing awg-quick shebang"
-        sed -i 's|#!/.*bash|#!/usr/local/bin/bash|' /usr/bin/awg-quick
+    # Fetch ifconfig sources from CDN if not present
+    if [ ! -f "$IFCFG_SRC/ifconfig.c" ]; then
+        local ver url
+        ver=$(uname -r)
+        url="https://cdn.openbsd.org/pub/OpenBSD/${ver}/src.tar.gz"
+        log "Fetching userland sources (streaming sbin/ifconfig only) from $url"
+        ftp -o - "$url" 2>/dev/null \
+            | tar -C /usr/src -xzf - sbin/ifconfig \
+            || die "Failed to extract sbin/ifconfig from src.tar.gz"
+        [ -f "$IFCFG_SRC/ifconfig.c" ] || die "ifconfig.c not found after extraction"
+        log "ifconfig sources extracted to $IFCFG_SRC"
     fi
 
-    log "awg + awg-quick installed to /usr/bin/"
+    # Install if_awg.h into system include path (needed to compile ifconfig)
+    cp "$REPODIR/src/if_awg.h" /usr/include/net/if_awg.h
+
+    # Apply patch (idempotent: check if already patched)
+    if grep -q 'A_AMNEZIAWG' "$IFCFG_SRC/ifconfig.c" 2>/dev/null; then
+        log "ifconfig.c already patched"
+    else
+        log "Patching ifconfig.c"
+        cp "$IFCFG_SRC/ifconfig.c" "$IFCFG_SRC/ifconfig.c.orig"
+        patch "$IFCFG_SRC/ifconfig.c" "$PATCH" \
+            || die "patch failed — ifconfig.c may differ from expected version"
+    fi
+
+    # Build and install
+    log "Building ifconfig"
+    cd "$IFCFG_SRC"
+    make || die "ifconfig build failed"
+    install -c -s -o root -g bin -m 555 ifconfig /sbin/ifconfig
+    install -c -o root -g bin -m 444 ifconfig.8 /usr/share/man/man8/ifconfig.8
+    log "ifconfig installed to /sbin/ifconfig"
 }
 
-# ── 4. AWG kernel driver ──────────────────────────────────────────────────────
+# ── 4. awg-quick ─────────────────────────────────────────────────────────────
+
+install_awg_quick() {
+    step "awg-quick"
+
+    install -m 755 "$REPODIR/sbin/awg-quick" /usr/bin/awg-quick
+    log "awg-quick installed to /usr/bin/awg-quick"
+}
+
+# ── 5. AWG kernel driver ──────────────────────────────────────────────────────
 
 install_kernel() {
     step "AWG kernel driver"
 
-    # Copy driver files into kernel source tree
     log "Copying driver files to $SRCDIR/net/"
     cp "$REPODIR/src/if_awg.h" "$SRCDIR/net/if_awg.h"
     cp "$REPODIR/src/if_awg.c" "$SRCDIR/net/if_awg.c"
@@ -149,12 +136,10 @@ install_kernel() {
             || die "conf/files patch failed — wg entry not found"
     fi
 
-    # Generate kernel build directory
     log "Configuring AWG.MP"
     cd "$SRCDIR/arch/amd64/conf"
     config AWG.MP
 
-    # Build (takes ~15 min)
     log "Building kernel — this takes ~15 minutes"
     cd "$SRCDIR/arch/amd64/compile/AWG.MP"
     make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee -a "$LOGFILE"
@@ -163,7 +148,7 @@ install_kernel() {
     log "Kernel installed to /bsd — reboot to activate"
 }
 
-# ── 5. Config directory ───────────────────────────────────────────────────────
+# ── 6. Config directory ───────────────────────────────────────────────────────
 
 setup_confdir() {
     if [ ! -d /etc/amnezia/amneziawg ]; then
@@ -173,18 +158,13 @@ setup_confdir() {
     fi
 }
 
-# ── 6. pf MSS clamping ────────────────────────────────────────────────────────
+# ── 7. pf MSS clamping ────────────────────────────────────────────────────────
 
 setup_pf_mss() {
     step "pf MSS clamping for awg interfaces"
 
     local PF_CONF=/etc/pf.conf
-    # 'awg' is the interface group — matches awg0, awg1, ... automatically
     local RULE='match on awg scrub (max-mss 1380)'
-
-    # awg-quick does not add MSS clamping automatically. Without it, TCP packets
-    # can exceed the tunnel MTU (1420) and get fragmented. The clamp ensures TCP
-    # MSS = 1420 - 20 (IP) - 20 (TCP) = 1380 on all awg* interfaces.
 
     if grep -q 'max-mss.*1380' "$PF_CONF" 2>/dev/null; then
         log "pf MSS clamp already present in $PF_CONF"
@@ -196,22 +176,18 @@ setup_pf_mss() {
         printf 'set skip on lo\n\n# Clamp TCP MSS to awg MTU (1420 - 40 = 1380)\n%s\n\nblock return\npass\n' "$RULE" > "$PF_CONF"
     else
         log "Adding MSS clamp rule to $PF_CONF"
-        # Insert after the first 'set skip' line, or prepend if none found
         if grep -q '^set skip' "$PF_CONF"; then
-            # Use awk to insert after the last 'set skip' line
             awk -v rule="$RULE" '
                 /^set skip/ { print; found=1; next }
                 found && !/^set skip/ { print "\n# Clamp TCP MSS to awg MTU (1420 - 40 = 1380)"; print rule; found=0 }
                 { print }
             ' "$PF_CONF" > "$PF_CONF.tmp" && mv "$PF_CONF.tmp" "$PF_CONF"
         else
-            # Prepend to file
             { printf '# Clamp TCP MSS to awg MTU (1420 - 40 = 1380)\n%s\n\n' "$RULE"; cat "$PF_CONF"; } > "$PF_CONF.tmp" \
                 && mv "$PF_CONF.tmp" "$PF_CONF"
         fi
     fi
 
-    # Validate and reload pf
     if pfctl -nf "$PF_CONF" 2>/dev/null; then
         pfctl -f "$PF_CONF" && log "pf reloaded with MSS clamp" || log "WARNING: pf reload failed — check $PF_CONF"
     else
@@ -225,7 +201,7 @@ usage() {
     cat <<EOF
 Usage: $0 [--tools-only | --kernel-only | --all]
 
-  --tools-only   Install awg + awg-quick CLI tools (no reboot needed)
+  --tools-only   Patch ifconfig + install awg-quick (no reboot needed)
   --kernel-only  Build and install AWG kernel (requires reboot)
   --all          Install everything: tools + kernel (default)
 
@@ -252,20 +228,21 @@ check_root
 case "$MODE" in
     tools)
         install_packages
-        fetch_submodules
-        install_tools
+        fetch_sys_sources
+        install_ifconfig
+        install_awg_quick
         setup_confdir
         setup_pf_mss
         ;;
     kernel)
-        install_kernel_packages
+        fetch_sys_sources
         install_kernel
         ;;
     all)
         install_packages
-        install_kernel_packages
-        fetch_submodules
-        install_tools
+        fetch_sys_sources
+        install_ifconfig
+        install_awg_quick
         setup_confdir
         setup_pf_mss
         install_kernel
