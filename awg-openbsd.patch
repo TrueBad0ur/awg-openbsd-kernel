@@ -122,7 +122,7 @@
 --- /dev/null	Mon Jun 22 17:15:12 2026
 +++ net/if_awg.c
 @@ -0,0 +1,2995 @@
-+/*	$OpenBSD: if_awg.c,v 1.0 2026/06/22 00:00:00 arekhov Exp $ */
++/*	$OpenBSD: if_awg.c,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
 +
 +/*
 + * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>

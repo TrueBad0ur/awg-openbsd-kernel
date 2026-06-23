@@ -1,0 +1,545 @@
+#!/usr/local/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# awg-quick for OpenBSD — uses ifconfig(8) for all configuration.
+# No external 'awg' tool required.
+#
+# Based on wg-quick/openbsd.bash from amneziawg-tools.
+
+set -e -o pipefail
+shopt -s extglob
+export LC_ALL=C
+
+exec 3>&2
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+PROGRAM="${0##*/}"
+ARGS=( "$@" )
+
+INTERFACE=""
+REAL_INTERFACE=""
+CONFIG_FILE=""
+
+# [Interface] fields
+PRIVATE_KEY=""
+LISTEN_PORT=""
+ADDRESSES=( )
+MTU=""
+DNS=( )
+DNS_SEARCH=( )
+TABLE=""
+PRE_UP=( )
+POST_UP=( )
+PRE_DOWN=( )
+POST_DOWN=( )
+
+# AWG obfuscation fields
+JC="" JMIN="" JMAX="" S1="" S2="" H1="" H2="" H3="" H4=""
+
+# [Peer] data — parallel arrays indexed by peer number
+PEER_COUNT=0
+PEER_PUBKEYS=( )
+PEER_PSKS=( )
+PEER_ENDPOINTS=( )
+PEER_ENDPOINT_IPS=( )  # resolved IPs read from kernel after set_config
+PEER_AIPS=( )    # space-separated per peer
+PEER_PKAS=( )
+
+# Routing state
+FIRSTADDR4=""
+FIRSTADDR6=""
+ENDPOINTS=( )
+GATEWAY4=""
+GATEWAY6=""
+
+cmd() {
+	echo "[#] $*" >&3
+	"$@"
+}
+
+die() {
+	echo "$PROGRAM: $*" >&2
+	exit 1
+}
+
+parse_options() {
+	local line key value stripped
+	local in_interface=0 in_peer=0
+	local cur_pubkey="" cur_psk="" cur_endpoint="" cur_aips="" cur_pka=""
+
+	CONFIG_FILE="$1"
+	[[ $CONFIG_FILE =~ ^[a-zA-Z0-9_=+.-]{1,15}$ ]] && \
+		CONFIG_FILE="/etc/amnezia/amneziawg/$CONFIG_FILE.conf"
+	[[ -e $CONFIG_FILE ]] || die "\`$CONFIG_FILE' does not exist"
+	[[ $CONFIG_FILE =~ (^|/)([a-zA-Z0-9_=+.-]{1,15})\.conf$ ]] || \
+		die "The config file must be a valid interface name, followed by .conf"
+	CONFIG_FILE="$(readlink -f "$CONFIG_FILE")"
+	INTERFACE="${BASH_REMATCH[2]}"
+
+	flush_peer() {
+		[[ -n $cur_pubkey ]] || return 0
+		PEER_PUBKEYS[$PEER_COUNT]="$cur_pubkey"
+		PEER_PSKS[$PEER_COUNT]="$cur_psk"
+		PEER_ENDPOINTS[$PEER_COUNT]="$cur_endpoint"
+		PEER_AIPS[$PEER_COUNT]="$cur_aips"
+		PEER_PKAS[$PEER_COUNT]="$cur_pka"
+		(( PEER_COUNT++ )) || true
+		cur_pubkey="" cur_psk="" cur_endpoint="" cur_aips="" cur_pka=""
+	}
+
+	shopt -s nocasematch
+	while IFS= read -r line || [[ -n $line ]]; do
+		stripped="${line%%\#*}"
+		key="${stripped%%=*}"; key="${key##*([[:space:]])}"; key="${key%%*([[:space:]])}"
+		value="${stripped#*=}"; value="${value##*([[:space:]])}"; value="${value%%*([[:space:]])}"
+
+		if [[ $key == "[Interface]" ]]; then
+			flush_peer; in_interface=1; in_peer=0; continue
+		fi
+		if [[ $key == "[Peer]" ]]; then
+			flush_peer; in_interface=0; in_peer=1; continue
+		fi
+
+		if [[ $in_interface -eq 1 ]]; then
+			case "$key" in
+			PrivateKey)            PRIVATE_KEY="$value" ;;
+			ListenPort)            LISTEN_PORT="$value" ;;
+			Address)               ADDRESSES+=( ${value//,/ } ) ;;
+			MTU)                   MTU="$value" ;;
+			DNS) for v in ${value//,/ }; do
+				[[ $v =~ (^[0-9.]+$)|(^.*:.*$) ]] && DNS+=( "$v" ) || DNS_SEARCH+=( "$v" )
+			done ;;
+			Table)                 TABLE="$value" ;;
+			PreUp)                 PRE_UP+=( "$value" ) ;;
+			PreDown)               PRE_DOWN+=( "$value" ) ;;
+			PostUp)                POST_UP+=( "$value" ) ;;
+			PostDown)              POST_DOWN+=( "$value" ) ;;
+			Jc)                    JC="$value" ;;
+			Jmin)                  JMIN="$value" ;;
+			Jmax)                  JMAX="$value" ;;
+			S1)                    S1="$value" ;;
+			S2)                    S2="$value" ;;
+			H1)                    H1="$value" ;;
+			H2)                    H2="$value" ;;
+			H3)                    H3="$value" ;;
+			H4)                    H4="$value" ;;
+			esac
+		elif [[ $in_peer -eq 1 ]]; then
+			case "$key" in
+			PublicKey)             cur_pubkey="$value" ;;
+			PresharedKey)          cur_psk="$value" ;;
+			Endpoint)              cur_endpoint="$value" ;;
+			AllowedIPs)            cur_aips+="${cur_aips:+ }${value//,/ }" ;;
+			PersistentKeepalive)   cur_pka="$value" ;;
+			esac
+		fi
+	done < "$CONFIG_FILE"
+	flush_peer
+	shopt -u nocasematch
+
+	[[ -n $PRIVATE_KEY ]] || die "PrivateKey not set in $CONFIG_FILE"
+}
+
+# Find existing awg/wg interface that matches INTERFACE name/description
+get_real_interface() {
+	local iface line
+	# Config name matches interface name directly (awg0, wg0, etc.)
+	if ifconfig "$INTERFACE" >/dev/null 2>&1; then
+		REAL_INTERFACE="$INTERFACE"
+		return 0
+	fi
+	# Arbitrary name: search for description "wg-quick: INTERFACE"
+	while IFS= read -r line; do
+		if [[ $line =~ ^([a-z]+[0-9]+):\ .+ ]]; then
+			iface="${BASH_REMATCH[1]}"
+			continue
+		fi
+		if [[ ($iface == wg* || $iface == awg*) && \
+		      $line =~ $'\t'description:\ wg-quick:\ (.+) && \
+		      ${BASH_REMATCH[1]} == "$INTERFACE" ]]; then
+			REAL_INTERFACE="$iface"
+			return 0
+		fi
+	done < <(ifconfig)
+	return 1
+}
+
+add_if() {
+	local ret index
+	# Config name is already awgN — create that exact interface
+	if [[ $INTERFACE =~ ^awg[0-9]+$ ]]; then
+		if ret="$(cmd ifconfig "$INTERFACE" create 2>&1)"; then
+			REAL_INTERFACE="$INTERFACE"
+			return 0
+		fi
+		[[ $ret == *"File exists"* ]] && { REAL_INTERFACE="$INTERFACE"; return 0; }
+		echo "$ret" >&3; return 1
+	fi
+	# Arbitrary name: pick next free awgN
+	while true; do
+		local existing
+		existing="$(ifconfig -a 2>/dev/null | grep -Eo '^awg[0-9]+' | sort -t g -k2 -n || true)"
+		for (( index=0; ; index++ )); do
+			grep -qx "awg$index" <<< "$existing" || break
+		done
+		if ret="$(cmd ifconfig awg$index create 2>&1)"; then
+			cmd ifconfig awg$index description "wg-quick: $INTERFACE"
+			REAL_INTERFACE="awg$index"
+			return 0
+		fi
+		[[ $ret == *"File exists"* ]] && continue
+		echo "$ret" >&3; return 1
+	done
+}
+
+del_if() {
+	unset_dns
+	[[ -n $REAL_INTERFACE ]] && cmd ifconfig "$REAL_INTERFACE" destroy
+}
+
+up_if() {
+	cmd ifconfig "$REAL_INTERFACE" up
+}
+
+# Configure AWG interface via ifconfig — no 'awg' tool needed
+set_config() {
+	local args=()
+
+	[[ -n $PRIVATE_KEY ]] || die "no PrivateKey"
+	args+=( awgkey "$PRIVATE_KEY" )
+	[[ -n $LISTEN_PORT ]] && args+=( awgport "$LISTEN_PORT" )
+
+	# AWG obfuscation params
+	if [[ -n $JC || -n $JMIN || -n $JMAX ]]; then
+		args+=( awgjc  "${JC:-0}"  awgjmin "${JMIN:-0}" awgjmax "${JMAX:-0}" )
+	fi
+	if [[ -n $S1 || -n $S2 ]]; then
+		args+=( awgs1 "${S1:-0}" awgs2 "${S2:-0}" )
+	fi
+	if [[ -n $H1 || -n $H2 || -n $H3 || -n $H4 ]]; then
+		args+=( awgh1 "${H1:-1}" awgh2 "${H2:-2}" awgh3 "${H3:-3}" awgh4 "${H4:-4}" )
+	fi
+
+	# Peers
+	local i
+	for (( i=0; i<PEER_COUNT; i++ )); do
+		args+=( awgpeer "${PEER_PUBKEYS[$i]}" )
+		[[ -n ${PEER_PSKS[$i]} ]]      && args+=( awgpsk      "${PEER_PSKS[$i]}" )
+		[[ -n ${PEER_PKAS[$i]} ]]      && args+=( awgpka      "${PEER_PKAS[$i]}" )
+		if [[ -n ${PEER_ENDPOINTS[$i]} ]]; then
+			local ep="${PEER_ENDPOINTS[$i]}"
+			# handle [::1]:port IPv6 format
+			if [[ $ep =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+				args+=( awgendpoint "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" )
+			elif [[ $ep =~ ^(.+):([0-9]+)$ ]]; then
+				args+=( awgendpoint "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" )
+			fi
+		fi
+		local aip
+		for aip in ${PEER_AIPS[$i]}; do
+			args+=( awgaip "$aip" )
+		done
+	done
+
+	cmd ifconfig "$REAL_INTERFACE" "${args[@]}"
+}
+
+add_addr() {
+	local family
+	if [[ $1 == *:* ]]; then
+		family=inet6
+		[[ -n $FIRSTADDR6 ]] || FIRSTADDR6="${1%/*}"
+	else
+		family=inet
+		[[ -n $FIRSTADDR4 ]] || FIRSTADDR4="${1%/*}"
+	fi
+	cmd ifconfig "$REAL_INTERFACE" $family "$1" alias
+}
+
+set_mtu() {
+	local mtu=0 endpoint output family host
+	if [[ -n $MTU ]]; then
+		cmd ifconfig "$REAL_INTERFACE" mtu "$MTU"
+		return
+	fi
+	local i
+	for (( i=0; i<PEER_COUNT; i++ )); do
+		endpoint="${PEER_ENDPOINTS[$i]}"
+		[[ -n $endpoint ]] || continue
+		if [[ $endpoint =~ ^\[(.+)\]:[0-9]+$ ]]; then
+			host="${BASH_REMATCH[1]}"; family=inet6
+		elif [[ $endpoint =~ ^(.+):[0-9]+$ ]]; then
+			host="${BASH_REMATCH[1]}"
+			[[ $host == *:* ]] && family=inet6 || family=inet
+		else
+			continue
+		fi
+		output="$(route -n get "-$family" "$host" 2>/dev/null || true)"
+		local iface
+		[[ $output =~ interface:\ ([^ $'\n']+) ]] && iface="${BASH_REMATCH[1]}" || continue
+		local ifmtu
+		[[ $(ifconfig "$iface" 2>/dev/null) =~ mtu\ ([0-9]+) ]] && ifmtu="${BASH_REMATCH[1]}" || continue
+		[[ $ifmtu -gt $mtu ]] && mtu=$ifmtu
+	done
+	if [[ $mtu -eq 0 ]]; then
+		output="$(route -n get default 2>/dev/null || true)"
+		local iface
+		[[ $output =~ interface:\ ([^ $'\n']+) ]] && iface="${BASH_REMATCH[1]}" || true
+		[[ -n $iface && $(ifconfig "$iface" 2>/dev/null) =~ mtu\ ([0-9]+) ]] && mtu="${BASH_REMATCH[1]}"
+	fi
+	[[ $mtu -gt 0 ]] || mtu=1500
+	cmd ifconfig "$REAL_INTERFACE" mtu $(( mtu - 80 ))
+}
+
+collect_gateways() {
+	GATEWAY4=""
+	while read -r destination gateway _; do
+		[[ $destination == default ]] || continue
+		GATEWAY4="$gateway"; break
+	done < <(netstat -nr -f inet)
+
+	GATEWAY6=""
+	while read -r destination gateway _; do
+		[[ $destination == default ]] || continue
+		GATEWAY6="$gateway"; break
+	done < <(netstat -nr -f inet6)
+}
+
+populate_endpoint_ips() {
+	# Read resolved endpoint IPs from the kernel (ifconfig already resolved hostnames
+	# when set_config ran awgendpoint). Output line: "awgendpoint IP PORT"
+	local i=0 line
+	while IFS= read -r line; do
+		if [[ $line =~ ^[[:space:]]*awgendpoint[[:space:]]+([^[:space:]]+)[[:space:]] ]]; then
+			PEER_ENDPOINT_IPS[$i]="${BASH_REMATCH[1]}"
+			(( i++ )) || true
+		fi
+	done < <(ifconfig "$REAL_INTERFACE" 2>/dev/null)
+}
+
+collect_endpoints() {
+	ENDPOINTS=( )
+	local i ip
+	for (( i=0; i<PEER_COUNT; i++ )); do
+		ip="${PEER_ENDPOINT_IPS[$i]}"
+		[[ -n $ip ]] || continue
+		ENDPOINTS+=( "$ip" )
+	done
+}
+
+del_routes() {
+	local todelete=( ) destination gateway netif
+	[[ -n $REAL_INTERFACE ]] || return 0
+	while read -r destination _ _ _ _ netif _; do
+		[[ $netif == "$REAL_INTERFACE" ]] && todelete+=( "$destination" )
+	done < <(netstat -nr -f inet)
+	for destination in "${todelete[@]}"; do
+		cmd route -q -n delete -inet "$destination" || true
+	done
+	todelete=( )
+	while read -r destination gateway _ netif; do
+		[[ $netif == "$REAL_INTERFACE" || ( $netif == lo* && $gateway == "$REAL_INTERFACE" ) ]] && \
+			todelete+=( "$destination" )
+	done < <(netstat -nr -f inet6)
+	for destination in "${todelete[@]}"; do
+		cmd route -q -n delete -inet6 "$destination" || true
+	done
+	for destination in "${ENDPOINTS[@]}"; do
+		if [[ $destination == *:* ]]; then
+			cmd route -q -n delete -inet6 "$destination" || true
+		else
+			cmd route -q -n delete -inet "$destination" || true
+		fi
+	done
+}
+
+add_route() {
+	[[ $TABLE != off ]] || return 0
+	local family ifaceroute
+	if [[ $1 == *:* ]]; then
+		family=inet6
+		[[ -n $FIRSTADDR6 ]] || die "Local IPv6 address must be set to have routes"
+		ifaceroute="$FIRSTADDR6"
+	else
+		family=inet
+		[[ -n $FIRSTADDR4 ]] || die "Local IPv4 address must be set to have routes"
+		ifaceroute="$FIRSTADDR4"
+	fi
+
+	if [[ -n $TABLE && $TABLE != auto ]]; then
+		cmd route -q -n -T "$TABLE" add "-$family" "$1" -iface "$ifaceroute"
+	elif [[ $1 == */0 ]]; then
+		if [[ $1 == *:* ]]; then
+			cmd route -q -n add -inet6 ::/1    -iface "$ifaceroute"
+			cmd route -q -n add -inet6 8000::/1 -iface "$ifaceroute"
+		else
+			cmd route -q -n add -inet 0.0.0.0/1   -iface "$ifaceroute"
+			cmd route -q -n add -inet 128.0.0.0/1 -iface "$ifaceroute"
+		fi
+	else
+		[[ $(route -n get "-$family" "$1" 2>/dev/null) =~ interface:\ $REAL_INTERFACE$'\n' ]] || \
+			cmd route -q -n add "-$family" "$1" -iface "$ifaceroute"
+	fi
+}
+
+set_endpoint_direct_route() {
+	local old_endpoints endpoint old_gateway4 old_gateway6 remove_all_old=0 added=( )
+	old_endpoints=( "${ENDPOINTS[@]}" )
+	old_gateway4="$GATEWAY4"
+	old_gateway6="$GATEWAY6"
+	collect_gateways
+	collect_endpoints
+
+	[[ $old_gateway4 != "$GATEWAY4" || $old_gateway6 != "$GATEWAY6" ]] && remove_all_old=1
+
+	if [[ $remove_all_old -eq 1 ]]; then
+		for endpoint in "${ENDPOINTS[@]}"; do
+			[[ " ${old_endpoints[*]} " == *" $endpoint "* ]] || old_endpoints+=( "$endpoint" )
+		done
+	fi
+
+	for endpoint in "${old_endpoints[@]}"; do
+		[[ $remove_all_old -eq 0 && " ${ENDPOINTS[*]} " == *" $endpoint "* ]] && continue
+		if [[ $endpoint == *:* ]]; then
+			cmd route -q -n delete -inet6 "$endpoint" 2>/dev/null || true
+		else
+			cmd route -q -n delete -inet "$endpoint" 2>/dev/null || true
+		fi
+	done
+
+	for endpoint in "${ENDPOINTS[@]}"; do
+		if [[ $remove_all_old -eq 0 && " ${old_endpoints[*]} " == *" $endpoint "* ]]; then
+			added+=( "$endpoint" ); continue
+		fi
+		if [[ $endpoint == *:* ]]; then
+			if [[ $(route -n get -inet6 "$endpoint" 2>/dev/null) =~ interface:\ $REAL_INTERFACE ]]; then
+				if [[ -n $GATEWAY6 ]]; then
+					cmd route -q -n add -inet6 "$endpoint" -gateway "$GATEWAY6" || true
+				else
+					cmd route -q -n add -inet6 "$endpoint" ::1 -blackhole || true
+				fi
+				added+=( "$endpoint" )
+			fi
+		else
+			if [[ $(route -n get -inet "$endpoint" 2>/dev/null) =~ interface:\ $REAL_INTERFACE ]]; then
+				if [[ -n $GATEWAY4 ]]; then
+					cmd route -q -n add -inet "$endpoint" -gateway "$GATEWAY4" || true
+				else
+					cmd route -q -n add -inet "$endpoint" 127.0.0.1 -blackhole || true
+				fi
+				added+=( "$endpoint" )
+			fi
+		fi
+	done
+	ENDPOINTS=( "${added[@]}" )
+}
+
+monitor_daemon() {
+	echo "[+] Backgrounding route monitor" >&2
+	(trap 'del_routes; exit 0' INT TERM EXIT
+	exec >/dev/null 2>&1
+	exec 19< <(exec route -n monitor)
+	local event
+	while read -u 19 -r event; do
+		[[ $event == RTM_* ]] || continue
+		ifconfig "$REAL_INTERFACE" >/dev/null 2>&1 || break
+		set_endpoint_direct_route
+	done) & disown
+}
+
+set_dns() {
+	[[ ${#DNS[@]} -gt 0 ]] || return 0
+	if pgrep -qx unwind; then
+		echo "[!] WARNING: unwind will leak DNS queries" >&2
+	elif ! pgrep -qx resolvd; then
+		echo "[+] resolvd is not running, DNS will not be configured" >&2
+		return 0
+	fi
+	cmd cp /etc/resolv.conf "/etc/resolv.conf.wg-quick-backup.$INTERFACE"
+	[[ ${#DNS_SEARCH[@]} -eq 0 ]] || cmd printf 'search %s\n' "${DNS_SEARCH[*]}" > /etc/resolv.conf
+	route nameserver "$REAL_INTERFACE" "${DNS[@]}"
+}
+
+unset_dns() {
+	[[ -f "/etc/resolv.conf.wg-quick-backup.$INTERFACE" ]] || return 0
+	route nameserver "$REAL_INTERFACE"
+	cmd mv "/etc/resolv.conf.wg-quick-backup.$INTERFACE" /etc/resolv.conf
+}
+
+execute_hooks() {
+	local hook
+	for hook in "$@"; do
+		hook="${hook//%i/$REAL_INTERFACE}"
+		hook="${hook//%I/$INTERFACE}"
+		echo "[#] $hook" >&2
+		(eval "$hook")
+	done
+}
+
+auto_su() {
+	[[ $UID == 0 ]] || exec doas -- "$BASH" -- "$SELF" "${ARGS[@]}"
+}
+
+cmd_up() {
+	get_real_interface && die "\`$INTERFACE' already exists as \`$REAL_INTERFACE'"
+	trap 'del_if; del_routes; exit' INT TERM EXIT
+	add_if
+	execute_hooks "${PRE_UP[@]}"
+	set_config
+	populate_endpoint_ips
+	local i
+	for i in "${ADDRESSES[@]}"; do add_addr "$i"; done
+	set_mtu
+	up_if
+	set_dns
+	local aip all_aips=( )
+	for (( i=0; i<PEER_COUNT; i++ )); do
+		for aip in ${PEER_AIPS[$i]}; do all_aips+=( "$aip" ); done
+	done
+	for aip in $(printf '%s\n' "${all_aips[@]}" | sort -nr -k2 -t/); do
+		add_route "$aip"
+	done
+	set_endpoint_direct_route
+	monitor_daemon
+	execute_hooks "${POST_UP[@]}"
+	trap - INT TERM EXIT
+}
+
+cmd_down() {
+	get_real_interface || die "\`$INTERFACE' is not a WireGuard/AWG interface"
+	execute_hooks "${PRE_DOWN[@]}"
+	collect_endpoints
+	del_if
+	unset_dns
+	execute_hooks "${POST_DOWN[@]}"
+}
+
+cmd_usage() {
+	cat >&2 <<-_EOF
+	Usage: $PROGRAM [ up | down ] [ CONFIG_FILE | INTERFACE ]
+
+	  CONFIG_FILE is a configuration file in /etc/amnezia/amneziawg/.
+	  INTERFACE is the filename without .conf.
+
+	  Supported [Interface] fields: PrivateKey, ListenPort, Address, MTU, DNS,
+	  Table, PreUp, PostUp, PreDown, PostDown,
+	  Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4.
+
+	  Configures the awg(4) interface entirely via ifconfig(8).
+	_EOF
+}
+
+if [[ $# -eq 1 && ( $1 == --help || $1 == -h || $1 == help ) ]]; then
+	cmd_usage
+elif [[ $# -eq 2 && $1 == up ]]; then
+	auto_su
+	parse_options "$2"
+	cmd_up
+elif [[ $# -eq 2 && $1 == down ]]; then
+	auto_su
+	parse_options "$2"
+	cmd_down
+else
+	cmd_usage
+	exit 1
+fi
+
+exit 0

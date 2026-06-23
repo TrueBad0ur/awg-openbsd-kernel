@@ -1,0 +1,528 @@
+--- /usr/src/sbin/ifconfig/ifconfig.c.orig	Tue Jun 23 13:48:24 2026
++++ /usr/src/sbin/ifconfig/ifconfig.c	Tue Jun 23 13:52:46 2026
+@@ -83,6 +83,7 @@
+ #include <net/if_pppoe.h>
+ #include <net/if_trunk.h>
+ #include <net/if_wg.h>
++#include <net/if_awg.h>
+ #include <net/trunklacp.h>
+ #include <net/if_sppp.h>
+ #include <net/ppp_defs.h>
+@@ -366,6 +367,30 @@
+ void	unsetwgpeerall(const char *, int);
+ 
+ void	wg_status(int);
++
++void	setawgpeer(const char *, int);
++void	setawgpeerdesc(const char *, int);
++void	setawgpeerep(const char *, const char *);
++void	setawgpeeraip(const char *, int);
++void	setawgpeerpsk(const char *, int);
++void	setawgpeerpka(const char *, int);
++void	setawgport(const char *, int);
++void	setawgkey(const char *, int);
++void	setawgrtable(const char *, int);
++void	setawgjc(const char *, int);
++void	setawgjmin(const char *, int);
++void	setawgjmax(const char *, int);
++void	setawgs1(const char *, int);
++void	setawgs2(const char *, int);
++void	setawgh1(const char *, int);
++void	setawgh2(const char *, int);
++void	setawgh3(const char *, int);
++void	setawgh4(const char *, int);
++void	unsetawgpeer(const char *, int);
++void	unsetawgpeerdesc(const char *, int);
++void	unsetawgpeerpsk(const char *, int);
++void	unsetawgpeerall(const char *, int);
++void	awg_status(int);
+ #else
+ void	setignore(const char *, int);
+ #endif
+@@ -394,6 +419,7 @@
+ #define	A_MEDIAMODE	0x0010		/* mode command */
+ #define	A_JOIN		0x0020		/* join */
+ #define	A_WIREGUARD	0x0040		/* any WireGuard command */
++#define	A_AMNEZIAWG	0x0080		/* any AmneziaWG command */
+ #define A_SILENT	0x8000000	/* doing operation, do not print */
+ 
+ #define	NEXTARG0	0xffffff
+@@ -657,6 +683,31 @@
+ 	{ "-wgdescr",	0,		A_WIREGUARD,	unsetwgpeerdesc},
+ 	{ "-wgpeerall",	0,		A_WIREGUARD,	unsetwgpeerall},
+ 
++	{ "awgpeer",	NEXTARG,	A_AMNEZIAWG,	setawgpeer},
++	{ "awgdescription", NEXTARG,	A_AMNEZIAWG,	setawgpeerdesc},
++	{ "awgdescr",	NEXTARG,	A_AMNEZIAWG,	setawgpeerdesc},
++	{ "awgendpoint",	NEXTARG2,	A_AMNEZIAWG,	NULL, setawgpeerep},
++	{ "awgaip",	NEXTARG,	A_AMNEZIAWG,	setawgpeeraip},
++	{ "awgpsk",	NEXTARG,	A_AMNEZIAWG,	setawgpeerpsk},
++	{ "awgpka",	NEXTARG,	A_AMNEZIAWG,	setawgpeerpka},
++	{ "awgport",	NEXTARG,	A_AMNEZIAWG,	setawgport},
++	{ "awgkey",	NEXTARG,	A_AMNEZIAWG,	setawgkey},
++	{ "awgrtable",	NEXTARG,	A_AMNEZIAWG,	setawgrtable},
++	{ "awgjc",	NEXTARG,	A_AMNEZIAWG,	setawgjc},
++	{ "awgjmin",	NEXTARG,	A_AMNEZIAWG,	setawgjmin},
++	{ "awgjmax",	NEXTARG,	A_AMNEZIAWG,	setawgjmax},
++	{ "awgs1",	NEXTARG,	A_AMNEZIAWG,	setawgs1},
++	{ "awgs2",	NEXTARG,	A_AMNEZIAWG,	setawgs2},
++	{ "awgh1",	NEXTARG,	A_AMNEZIAWG,	setawgh1},
++	{ "awgh2",	NEXTARG,	A_AMNEZIAWG,	setawgh2},
++	{ "awgh3",	NEXTARG,	A_AMNEZIAWG,	setawgh3},
++	{ "awgh4",	NEXTARG,	A_AMNEZIAWG,	setawgh4},
++	{ "-awgpeer",	NEXTARG,	A_AMNEZIAWG,	unsetawgpeer},
++	{ "-awgpsk",	0,		A_AMNEZIAWG,	unsetawgpeerpsk},
++	{ "-awgdescription", 0,	A_AMNEZIAWG,	unsetawgpeerdesc},
++	{ "-awgdescr",	0,		A_AMNEZIAWG,	unsetawgpeerdesc},
++	{ "-awgpeerall",	0,		A_AMNEZIAWG,	unsetawgpeerall},
++
+ #else /* SMALL */
+ 	{ "powersave",	NEXTARG0,	0,		setignore },
+ 	{ "priority",	NEXTARG,	0,		setignore },
+@@ -730,6 +781,7 @@
+ void	process_join_commands(void);
+ 
+ void	process_wg_commands(void);
++void	process_awg_commands(void);
+ 
+ void	in_status(int);
+ void	in_getaddr(const char *, int);
+@@ -980,6 +1032,7 @@
+ 
+ #ifndef SMALL
+ 	process_wg_commands();
++	process_awg_commands();
+ #endif
+ 
+ 	process_join_commands();
+@@ -3410,6 +3463,7 @@
+ 	pflow_status();
+ 	umb_status();
+ 	wg_status(ifaliases);
++	awg_status(ifaliases);
+ #endif
+ 	trunk_status();
+ 	getifgroups();
+@@ -6056,6 +6110,422 @@
+ out:
+ 	free(wgdata.wgd_interface);
+ }
++
++
++/* AmneziaWG implementation */
++
++#define AWG_BASE64_KEY_LEN (4 * ((AWG_KEY_LEN + 2) / 3))
++#define AWG_LOAD_KEY(dst, src, fn_name) do {				\
++	uint8_t _tmp[AWG_KEY_LEN]; int _r;				\
++	if (strlen(src) != AWG_BASE64_KEY_LEN)				\
++		errx(1, fn_name " (key): invalid length");		\
++	if ((_r = b64_pton(src, _tmp, sizeof(_tmp))) != sizeof(_tmp))	\
++		errx(1, fn_name " (key): invalid base64 %d/%zu", _r, sizeof(_tmp)); \
++	memcpy(dst, _tmp, AWG_KEY_LEN);					\
++} while (0)
++
++struct awg_data_io	 awgdata = { 0 };
++struct awg_interface_io	*awgi_interface = NULL;
++struct awg_peer_io	*awgi_peer = NULL;
++struct awg_aip_io	*awgi_aip = NULL;
++
++void
++ensureawginterface(void)
++{
++	if (awgi_interface != NULL)
++		return;
++	awgdata.wgd_size = sizeof(*awgi_interface);
++	awgdata.wgd_interface = awgi_interface = calloc(1, awgdata.wgd_size);
++	if (awgi_interface == NULL)
++		err(1, "calloc");
++}
++
++void
++growawgdata(size_t by)
++{
++	ptrdiff_t peer_offset, aip_offset;
++
++	if (awgi_interface == NULL)
++		awgdata.wgd_size = sizeof(*awgi_interface);
++
++	peer_offset = (void *)awgi_peer - (void *)awgi_interface;
++	aip_offset = (void *)awgi_aip - (void *)awgi_interface;
++
++	awgdata.wgd_size += by;
++	awgdata.wgd_interface = realloc(awgi_interface, awgdata.wgd_size);
++	if (awgdata.wgd_interface == NULL)
++		err(1, "calloc");
++	if (awgi_interface == NULL)
++		bzero(awgdata.wgd_interface, sizeof(*awgi_interface));
++	awgi_interface = awgdata.wgd_interface;
++
++	if (awgi_peer != NULL)
++		awgi_peer = (void *)awgi_interface + peer_offset;
++	if (awgi_aip != NULL)
++		awgi_aip = (void *)awgi_interface + aip_offset;
++
++	bzero((char *)awgi_interface + awgdata.wgd_size - by, by);
++}
++
++void
++setawgpeer(const char *peerkey_b64, int param)
++{
++	growawgdata(sizeof(*awgi_peer));
++	if (awgi_aip)
++		awgi_peer = (struct awg_peer_io *)awgi_aip;
++	else
++		awgi_peer = &awgi_interface->i_peers[0];
++	awgi_aip = &awgi_peer->p_aips[0];
++	awgi_peer->p_flags |= AWG_PEER_HAS_PUBLIC;
++	AWG_LOAD_KEY(awgi_peer->p_public, peerkey_b64, "awgpeer");
++	awgi_interface->i_peers_count++;
++}
++
++void
++setawgpeerdesc(const char *descr, int param)
++{
++	if (awgi_peer == NULL)
++		errx(1, "awgdescr: awgpeer not set");
++	awgi_peer->p_flags |= AWG_PEER_SET_DESCRIPTION;
++	strlcpy(awgi_peer->p_description, descr, IFDESCRSIZE);
++}
++
++void
++setawgpeeraip(const char *aip, int param)
++{
++	int res;
++	if (awgi_peer == NULL)
++		errx(1, "awgaip: awgpeer not set");
++
++	growawgdata(sizeof(*awgi_aip));
++
++	if ((res = inet_net_pton(AF_INET, aip, &awgi_aip->a_ipv4,
++	    sizeof(awgi_aip->a_ipv4))) != -1) {
++		awgi_aip->a_af = AF_INET;
++	} else if ((res = inet_net_pton(AF_INET6, aip, &awgi_aip->a_ipv6,
++	    sizeof(awgi_aip->a_ipv6))) != -1) {
++		awgi_aip->a_af = AF_INET6;
++	} else {
++		errx(1, "awgaip: bad address");
++	}
++
++	awgi_aip->a_cidr = res;
++
++	awgi_peer->p_flags |= AWG_PEER_REPLACE_AIPS;
++	awgi_peer->p_aips_count++;
++
++	awgi_aip++;
++}
++
++void
++setawgpeerep(const char *host, const char *service)
++{
++	int error;
++	struct addrinfo *ai;
++
++	if (awgi_peer == NULL)
++		errx(1, "awgendpoint: awgpeer not set");
++
++	if ((error = getaddrinfo(host, service, NULL, &ai)) != 0)
++		errx(1, "%s", gai_strerror(error));
++
++	awgi_peer->p_flags |= AWG_PEER_HAS_ENDPOINT;
++	memcpy(&awgi_peer->p_sa, ai->ai_addr, ai->ai_addrlen);
++	freeaddrinfo(ai);
++}
++
++void
++setawgpeerpsk(const char *psk_b64, int param)
++{
++	if (awgi_peer == NULL)
++		errx(1, "awgpsk: awgpeer not set");
++	awgi_peer->p_flags |= AWG_PEER_HAS_PSK;
++	AWG_LOAD_KEY(awgi_peer->p_psk, psk_b64, "awgpsk");
++}
++
++void
++setawgpeerpka(const char *pka, int param)
++{
++	const char *errmsg = NULL;
++	if (awgi_peer == NULL)
++		errx(1, "awgpka: awgpeer not set");
++	awgi_peer->p_flags |= AWG_PEER_HAS_PKA;
++	awgi_peer->p_pka = strtonum(pka, 0, 43200, &errmsg);
++	if (errmsg)
++		errx(1, "awgpka: %s, %s", pka, errmsg);
++}
++
++void
++setawgport(const char *port, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_PORT;
++	awgi_interface->i_port = strtonum(port, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgport: %s, %s", port, errmsg);
++}
++
++void
++setawgkey(const char *private_b64, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_PRIVATE;
++	AWG_LOAD_KEY(awgi_interface->i_private, private_b64, "awgkey");
++}
++
++void
++setawgrtable(const char *id, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_RTABLE;
++	awgi_interface->i_rtable = strtonum(id, 0, RT_TABLEID_MAX, &errmsg);
++	if (errmsg)
++		errx(1, "awgrtable %s: %s", id, errmsg);
++}
++
++void
++setawgjc(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_JC;
++	awgi_interface->i_jc = strtonum(val, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgjc: %s, %s", val, errmsg);
++}
++
++void
++setawgjmin(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_JC;
++	awgi_interface->i_jmin = strtonum(val, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgjmin: %s, %s", val, errmsg);
++}
++
++void
++setawgjmax(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_JC;
++	awgi_interface->i_jmax = strtonum(val, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgjmax: %s, %s", val, errmsg);
++}
++
++void
++setawgs1(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_S12;
++	awgi_interface->i_s1 = strtonum(val, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgs1: %s, %s", val, errmsg);
++}
++
++void
++setawgs2(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_S12;
++	awgi_interface->i_s2 = strtonum(val, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgs2: %s, %s", val, errmsg);
++}
++
++void
++setawgh1(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
++	awgi_interface->i_h1 = strtonum(val, 0, 4294967295LL, &errmsg);
++	if (errmsg)
++		errx(1, "awgh1: %s, %s", val, errmsg);
++}
++
++void
++setawgh2(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
++	awgi_interface->i_h2 = strtonum(val, 0, 4294967295LL, &errmsg);
++	if (errmsg)
++		errx(1, "awgh2: %s, %s", val, errmsg);
++}
++
++void
++setawgh3(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
++	awgi_interface->i_h3 = strtonum(val, 0, 4294967295LL, &errmsg);
++	if (errmsg)
++		errx(1, "awgh3: %s, %s", val, errmsg);
++}
++
++void
++setawgh4(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
++	awgi_interface->i_h4 = strtonum(val, 0, 4294967295LL, &errmsg);
++	if (errmsg)
++		errx(1, "awgh4: %s, %s", val, errmsg);
++}
++
++void
++unsetawgpeer(const char *peerkey_b64, int param)
++{
++	setawgpeer(peerkey_b64, param);
++	awgi_peer->p_flags |= AWG_PEER_REMOVE;
++}
++
++void
++unsetawgpeerdesc(const char *descr, int param)
++{
++	if (awgi_peer == NULL)
++		errx(1, "awgdescr: awgpeer not set");
++	awgi_peer->p_flags |= AWG_PEER_SET_DESCRIPTION;
++	strlcpy(awgi_peer->p_description, "", IFDESCRSIZE);
++}
++
++void
++unsetawgpeerpsk(const char *value, int param)
++{
++	if (awgi_peer == NULL)
++		errx(1, "awgpsk: awgpeer not set");
++	awgi_peer->p_flags |= AWG_PEER_HAS_PSK;
++	bzero(awgi_peer->p_psk, AWG_KEY_LEN);
++}
++
++void
++unsetawgpeerall(const char *value, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_REPLACE_PEERS;
++}
++
++void
++process_awg_commands(void)
++{
++	if (actions & A_AMNEZIAWG) {
++		strlcpy(awgdata.wgd_name, ifname, sizeof(awgdata.wgd_name));
++
++		if (ioctl(sock, SIOCSAWG, (caddr_t)&awgdata) == -1)
++			err(1, "%s: SIOCSAWG", awgdata.wgd_name);
++	}
++}
++
++void
++awg_status(int ifaliases)
++{
++	size_t			 i, j, last_size;
++	struct timespec		 now;
++	char			 hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
++	char			 key[AWG_BASE64_KEY_LEN + 1];
++
++	strlcpy(awgdata.wgd_name, ifname, sizeof(awgdata.wgd_name));
++	awgdata.wgd_size = 0;
++	awgdata.wgd_interface = NULL;
++	for (last_size = awgdata.wgd_size;; last_size = awgdata.wgd_size) {
++		if (ioctl(sock, SIOCGAWG, (caddr_t)&awgdata) < 0) {
++			if (errno == ENOTTY)
++				goto out;
++			err(1, "%s: SIOCGAWG", awgdata.wgd_name);
++		}
++		if (last_size >= awgdata.wgd_size)
++			break;
++		awgdata.wgd_interface = realloc(awgdata.wgd_interface,
++		    awgdata.wgd_size);
++		if (!awgdata.wgd_interface)
++			err(1, "realloc");
++	}
++	awgi_interface = awgdata.wgd_interface;
++
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_PORT)
++		printf("\tawgport %hu\n", awgi_interface->i_port);
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_RTABLE)
++		printf("\tawgrtable %d\n", awgi_interface->i_rtable);
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_PUBLIC) {
++		b64_ntop(awgi_interface->i_public, AWG_KEY_LEN,
++		    key, sizeof(key));
++		printf("\tawgpubkey %s\n", key);
++	}
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_JC)
++		printf("\tawgjc %u awgjmin %u awgjmax %u\n",
++		    awgi_interface->i_jc, awgi_interface->i_jmin,
++		    awgi_interface->i_jmax);
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_S12)
++		printf("\tawgs1 %u awgs2 %u\n",
++		    awgi_interface->i_s1, awgi_interface->i_s2);
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_H)
++		printf("\tawgh1 %u awgh2 %u awgh3 %u awgh4 %u\n",
++		    awgi_interface->i_h1, awgi_interface->i_h2,
++		    awgi_interface->i_h3, awgi_interface->i_h4);
++
++	if (ifaliases) {
++		awgi_peer = &awgi_interface->i_peers[0];
++		for (i = 0; i < awgi_interface->i_peers_count; i++) {
++			b64_ntop(awgi_peer->p_public, AWG_KEY_LEN,
++			    key, sizeof(key));
++			printf("\tawgpeer %s\n", key);
++
++			if (strlen(awgi_peer->p_description))
++				printf("\t\tawgdescr: %s\n",
++				    awgi_peer->p_description);
++
++			if (awgi_peer->p_flags & AWG_PEER_HAS_PSK)
++				printf("\t\tawgpsk (present)\n");
++
++			if (awgi_peer->p_flags & AWG_PEER_HAS_PKA &&
++			    awgi_peer->p_pka)
++				printf("\t\tawgpka %u (sec)\n", awgi_peer->p_pka);
++
++			if (awgi_peer->p_flags & AWG_PEER_HAS_ENDPOINT) {
++				if (getnameinfo(&awgi_peer->p_sa,
++				    awgi_peer->p_sa.sa_len,
++				    hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
++				    NI_NUMERICHOST | NI_NUMERICSERV) == 0)
++					printf("\t\tawgendpoint %s %s\n", hbuf, sbuf);
++				else
++					printf("\t\tawgendpoint unable to print\n");
++			}
++
++			printf("\t\ttx: %llu, rx: %llu\n",
++			    awgi_peer->p_txbytes, awgi_peer->p_rxbytes);
++
++			if (awgi_peer->p_last_handshake.tv_sec != 0) {
++				clock_gettime(CLOCK_REALTIME, &now);
++				printf("\t\tlast handshake: %lld seconds ago\n",
++				    now.tv_sec -
++				    awgi_peer->p_last_handshake.tv_sec);
++			}
++
++			awgi_aip = &awgi_peer->p_aips[0];
++			for (j = 0; j < awgi_peer->p_aips_count; j++) {
++				inet_ntop(awgi_aip->a_af, &awgi_aip->a_addr,
++				    hbuf, sizeof(hbuf));
++				printf("\t\tawgaip %s/%d\n", hbuf, awgi_aip->a_cidr);
++				awgi_aip++;
++			}
++			awgi_peer = (struct awg_peer_io *)awgi_aip;
++		}
++	}
++out:
++	free(awgdata.wgd_interface);
++}
++
+ 
+ const struct umb_valdescr umb_regstate[] = MBIM_REGSTATE_DESCRIPTIONS;
+ const struct umb_valdescr umb_dataclass[] = MBIM_DATACLASS_DESCRIPTIONS;
