@@ -176,7 +176,6 @@ src/                  kernel driver files
   AWG.MP              kernel configuration
 dependencies/
   amneziawg-tools/    awg + awg-quick CLI (git submodule)
-  amneziawg-go/       userspace fallback daemon (git submodule, not required)
 awg-openbsd.patch     unified diff of all kernel changes (patch -p0 from /usr/src/sys)
 install.sh            build + install script
 ```

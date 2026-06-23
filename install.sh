@@ -88,7 +88,6 @@ fetch_submodules() {
         # Allow git to operate in this repo regardless of directory ownership
         git config --global --add safe.directory "$REPODIR"
         git config --global --add safe.directory "$DEPSDIR/amneziawg-tools"
-        git config --global --add safe.directory "$DEPSDIR/amneziawg-go"
         if [ ! -f "$DEPSDIR/amneziawg-tools/src/Makefile" ]; then
             log "Initialising submodules"
             git submodule update --init --recursive
@@ -193,6 +192,7 @@ setup_pf_mss() {
     step "pf MSS clamping for awg interfaces"
 
     local PF_CONF=/etc/pf.conf
+    # 'awg' is the interface group — matches awg0, awg1, ... automatically
     local RULE='match on awg scrub (max-mss 1380)'
 
     # awg-quick does not add MSS clamping automatically. Without it, TCP packets
