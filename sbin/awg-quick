@@ -61,7 +61,7 @@ die() {
 }
 
 parse_options() {
-	local line key value stripped
+	local line key value stripped v
 	local in_interface=0 in_peer=0
 	local cur_pubkey="" cur_psk="" cur_endpoint="" cur_aips="" cur_pka=""
 
@@ -455,12 +455,12 @@ set_dns() {
 	fi
 	cmd cp /etc/resolv.conf "/etc/resolv.conf.wg-quick-backup.$INTERFACE"
 	[[ ${#DNS_SEARCH[@]} -eq 0 ]] || cmd printf 'search %s\n' "${DNS_SEARCH[*]}" > /etc/resolv.conf
-	route nameserver "$REAL_INTERFACE" "${DNS[@]}"
+	cmd route nameserver "$REAL_INTERFACE" "${DNS[@]}"
 }
 
 unset_dns() {
 	[[ -f "/etc/resolv.conf.wg-quick-backup.$INTERFACE" ]] || return 0
-	route nameserver "$REAL_INTERFACE"
+	cmd route nameserver "$REAL_INTERFACE"
 	cmd mv "/etc/resolv.conf.wg-quick-backup.$INTERFACE" /etc/resolv.conf
 }
 

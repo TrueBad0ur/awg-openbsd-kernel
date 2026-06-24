@@ -46,10 +46,9 @@ fetch_sys_sources() {
         ver=$(uname -r)
         url="https://cdn.openbsd.org/pub/OpenBSD/${ver}/sys.tar.gz"
         log "Fetching kernel sources from $url"
-        ftp -o /dev/null "$url" 2>/dev/null \
-            || die "sys.tar.gz not found at $url — CDN only carries 7.7+. Download manually and extract to /usr/src"
         mkdir -p /usr/src
-        ftp -o /tmp/sys.tar.gz "$url" || die "Failed to download sys.tar.gz"
+        ftp -o /tmp/sys.tar.gz "$url" 2>/dev/null \
+            || die "Failed to download $url — CDN only carries 7.7+. Download manually and extract to /usr/src"
         tar -C /usr/src -xzf /tmp/sys.tar.gz || die "Failed to extract sys.tar.gz"
         rm -f /tmp/sys.tar.gz
         [ -f "$SRCDIR/net/if_wg.c" ] || die "sys.tar.gz extracted but $SRCDIR/net/if_wg.c not found"
