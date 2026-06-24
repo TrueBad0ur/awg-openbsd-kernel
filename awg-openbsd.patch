@@ -1,6 +1,8 @@
---- /dev/null	Mon Jun 22 17:15:12 2026
-+++ net/if_awg.h
-@@ -0,0 +1,117 @@
+--- /dev/null	Wed Jun 24 16:35:52 2026
++++ net/if_awg.h	Wed Jun 24 16:35:52 2026
+@@ -0,0 +1,119 @@
++/*	$OpenBSD: if_awg.h,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
++
 +/*
 + * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
 + * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
@@ -119,8 +121,8 @@
 +
 +#endif /* __IF_AWG_H__ */
 
---- /dev/null	Mon Jun 22 17:15:12 2026
-+++ net/if_awg.c
+--- /dev/null	Wed Jun 24 16:35:52 2026
++++ net/if_awg.c	Wed Jun 24 16:35:52 2026
 @@ -0,0 +1,2995 @@
 +/*	$OpenBSD: if_awg.c,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
 +
@@ -3118,28 +3120,9 @@
 +			IPL_NET, 0, "awgratelimit", NULL);
 +}
 
---- /dev/null	Mon Jun 22 17:15:12 2026
-+++ arch/amd64/conf/AWG.MP
-@@ -0,0 +1,3 @@
-+include "arch/amd64/conf/GENERIC.MP"
-+
-+pseudo-device awg
-
---- conf/files.orig
-+++ conf/files
-@@ -613,6 +613,7 @@
- pseudo-device pppx: ifnet
- pseudo-device vxlan: ifnet, ether, etherbridge
- pseudo-device wg: ifnet
+--- sys/conf/files.orig
++++ sys/conf/files
+@@ pseudo-device wg: ifnet
 +pseudo-device awg: ifnet
- 
- pseudo-device af_frame
- file	net/af_frame.c			af_frame needs-flag
-@@ -884,6 +885,7 @@
- file net/if_pppx.c			pppx			needs-count
- file net/if_vxlan.c			vxlan
- file net/if_wg.c			wg
+@@ file net/if_wg.c
 +file net/if_awg.c			awg
- file net/wg_noise.c			wg
- file net/wg_cookie.c			wg
- file net/bfd.c				bfd
