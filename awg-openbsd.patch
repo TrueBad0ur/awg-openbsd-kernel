@@ -1,5 +1,5 @@
---- /dev/null	Wed Jun 24 16:35:52 2026
-+++ net/if_awg.h	Wed Jun 24 16:35:52 2026
+--- /dev/null	Thu Jun 25 13:33:34 2026
++++ net/if_awg.h	Thu Jun 25 13:33:34 2026
 @@ -0,0 +1,119 @@
 +/*	$OpenBSD: if_awg.h,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
 +
@@ -121,8 +121,8 @@
 +
 +#endif /* __IF_AWG_H__ */
 
---- /dev/null	Wed Jun 24 16:35:52 2026
-+++ net/if_awg.c	Wed Jun 24 16:35:52 2026
+--- /dev/null	Thu Jun 25 13:33:34 2026
++++ net/if_awg.c	Thu Jun 25 13:33:34 2026
 @@ -0,0 +1,2995 @@
 +/*	$OpenBSD: if_awg.c,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
 +

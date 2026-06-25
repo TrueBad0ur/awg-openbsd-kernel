@@ -512,12 +512,90 @@ cmd_down() {
 	execute_hooks "${POST_DOWN[@]}"
 }
 
+format_bytes() {
+	local b=$(( ${1:-0} ))
+	if   (( b >= 1073741824 )); then printf '%d GiB' "$(( b / 1073741824 ))"
+	elif (( b >= 1048576    )); then printf '%d MiB' "$(( b / 1048576 ))"
+	elif (( b >= 1024       )); then printf '%d KiB' "$(( b / 1024 ))"
+	else                             printf '%d B'   "$b"
+	fi
+}
+
+_show_flush_peer() {
+	[[ -n $_p_key ]] || return 0
+	echo ""
+	echo "peer: $_p_key"
+	[[ -n $_p_psk  ]] && echo "  preshared key: (hidden)"
+	[[ -n $_p_ep   ]] && echo "  endpoint: $_p_ep"
+	[[ -n $_p_aips ]] && echo "  allowed ips: $_p_aips"
+	[[ -n $_p_hs   ]] && echo "  latest handshake: $_p_hs"
+	[[ -n $_p_rx || -n $_p_tx ]] && \
+		echo "  transfer: $(format_bytes "${_p_rx:-0}") received, $(format_bytes "${_p_tx:-0}") sent"
+	[[ -n $_p_pka  ]] && echo "  persistent keepalive: every $_p_pka seconds"
+	_p_key="" _p_psk="" _p_pka="" _p_ep="" _p_aips="" _p_tx="" _p_rx="" _p_hs=""
+}
+
+show_iface() {
+	local iface="$1" line
+	_p_key="" _p_psk="" _p_pka="" _p_ep="" _p_aips="" _p_tx="" _p_rx="" _p_hs=""
+
+	echo "interface: $iface"
+	while IFS= read -r line; do
+		if   [[ $line =~ ^[[:space:]]+awgport[[:space:]]+([0-9]+) ]]; then
+			echo "  listening port: ${BASH_REMATCH[1]}"
+		elif [[ $line =~ ^[[:space:]]+awgpubkey[[:space:]]+([^[:space:]]+) ]]; then
+			echo "  public key: ${BASH_REMATCH[1]}"
+		elif [[ $line =~ ^[[:space:]]+awgjc[[:space:]]+([0-9]+)[[:space:]]+awgjmin[[:space:]]+([0-9]+)[[:space:]]+awgjmax[[:space:]]+([0-9]+) ]]; then
+			echo "  jc: ${BASH_REMATCH[1]}  jmin: ${BASH_REMATCH[2]}  jmax: ${BASH_REMATCH[3]}"
+		elif [[ $line =~ ^[[:space:]]+awgs1[[:space:]]+([0-9]+)[[:space:]]+awgs2[[:space:]]+([0-9]+) ]]; then
+			echo "  s1: ${BASH_REMATCH[1]}  s2: ${BASH_REMATCH[2]}"
+		elif [[ $line =~ ^[[:space:]]+awgh1[[:space:]]+([0-9]+)[[:space:]]+awgh2[[:space:]]+([0-9]+)[[:space:]]+awgh3[[:space:]]+([0-9]+)[[:space:]]+awgh4[[:space:]]+([0-9]+) ]]; then
+			echo "  h1: ${BASH_REMATCH[1]}  h2: ${BASH_REMATCH[2]}  h3: ${BASH_REMATCH[3]}  h4: ${BASH_REMATCH[4]}"
+		elif [[ $line =~ ^[[:space:]]+awgpeer[[:space:]]+([^[:space:]]+) ]]; then
+			_show_flush_peer; _p_key="${BASH_REMATCH[1]}"
+		elif [[ $line =~ ^[[:space:]]+awgpsk ]]; then
+			_p_psk=1
+		elif [[ $line =~ ^[[:space:]]+awgpka[[:space:]]+([0-9]+) ]]; then
+			_p_pka="${BASH_REMATCH[1]}"
+		elif [[ $line =~ ^[[:space:]]+awgendpoint[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
+			_p_ep="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
+		elif [[ $line =~ ^[[:space:]]+'tx: '([0-9]+)', rx: '([0-9]+) ]]; then
+			_p_tx="${BASH_REMATCH[1]}"; _p_rx="${BASH_REMATCH[2]}"
+		elif [[ $line =~ ^[[:space:]]+'last handshake: '([0-9]+)' seconds ago' ]]; then
+			_p_hs="${BASH_REMATCH[1]} seconds ago"
+		elif [[ $line =~ ^[[:space:]]+awgaip[[:space:]]+([^[:space:]]+) ]]; then
+			_p_aips+="${_p_aips:+, }${BASH_REMATCH[1]}"
+		fi
+	done < <(ifconfig "$iface" 2>/dev/null)
+	_show_flush_peer
+}
+
+cmd_show() {
+	local name="${1:-}" iface ifaces first=1
+	if [[ -z $name ]]; then
+		ifaces="$(ifconfig -a 2>/dev/null | grep -Eo '^awg[0-9]+' || true)"
+		[[ -n $ifaces ]] || die "no active awg interfaces"
+		while IFS= read -r iface; do
+			[[ $first -eq 1 ]] || echo ""
+			show_iface "$iface"
+			first=0
+		done <<< "$ifaces"
+	else
+		INTERFACE="${name%.conf}"
+		get_real_interface || die "\`$name' is not an active AWG interface"
+		show_iface "$REAL_INTERFACE"
+	fi
+}
+
 cmd_usage() {
 	cat >&2 <<-_EOF
-	Usage: $PROGRAM [ up | down ] [ CONFIG_FILE | INTERFACE ]
+	Usage: $PROGRAM [ up | down | show ] [ CONFIG_FILE | INTERFACE ]
 
 	  CONFIG_FILE is a configuration file in /etc/amnezia/amneziawg/.
 	  INTERFACE is the filename without .conf.
+
+	  up | down    Bring tunnel up or down.
+	  show         Show status of all active awg interfaces (or a specific one).
 
 	  Supported [Interface] fields: PrivateKey, ListenPort, Address, MTU, DNS,
 	  Table, PreUp, PostUp, PreDown, PostDown,
@@ -529,6 +607,12 @@ cmd_usage() {
 
 if [[ $# -eq 1 && ( $1 == --help || $1 == -h || $1 == help ) ]]; then
 	cmd_usage
+elif [[ $# -eq 1 && $1 == show ]]; then
+	auto_su
+	cmd_show
+elif [[ $# -eq 2 && $1 == show ]]; then
+	auto_su
+	cmd_show "$2"
 elif [[ $# -eq 2 && $1 == up ]]; then
 	auto_su
 	parse_options "$2"
