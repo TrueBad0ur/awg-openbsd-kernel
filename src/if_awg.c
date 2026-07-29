@@ -166,7 +166,7 @@ struct awg_index {
 };
 
 struct awg_timers {
-	/* t_mtx is for blocking wg_timers_event_* when setting t_disabled. */
+	/* t_mtx is for blocking awg_timers_event_* when setting t_disabled. */
 	struct mutex		 t_mtx;
 
 	int			 t_disabled;
@@ -546,7 +546,7 @@ awg_peer_destroy(struct awg_peer *peer)
 			continue;
 		}
 		NET_UNLOCK();
-		tsleep_nsec(&nowake, PWAIT, "wg_ifq", 1000);
+		tsleep_nsec(&nowake, PWAIT, "awg_ifq", 1000);
 		NET_LOCK();
 	}
 	NET_UNLOCK();
@@ -795,7 +795,7 @@ void
 awg_socket_close(struct socket **so)
 {
 	if (*so != NULL && soclose(*so, 0) != 0)
-		panic("Unable to close wg socket");
+		panic("Unable to close awg socket");
 	*so = NULL;
 }
 
@@ -948,7 +948,7 @@ awg_tag_get(struct mbuf *m)
 
 /*
  * The following section handles the timeout callbacks for a WireGuard session.
- * These functions provide an "event based" model for controlling wg(8) session
+ * These functions provide an "event based" model for controlling awg(4) session
  * timers. All function calls occur after the specified event below.
  *
  * awg_timers_event_data_sent:
@@ -978,7 +978,7 @@ void
 awg_timers_init(struct awg_timers *t)
 {
 	bzero(t, sizeof(*t));
-	mtx_init_flags(&t->t_mtx, IPL_NET, "wg_timers", 0);
+	mtx_init_flags(&t->t_mtx, IPL_NET, "awg_timers", 0);
 	mtx_init(&t->t_handshake_mtx, IPL_NET);
 
 	timeout_set(&t->t_new_handshake, awg_timers_run_new_handshake, t);
@@ -1314,7 +1314,7 @@ void
 awg_send_initiation(void *_peer)
 {
 	struct awg_peer			*peer = _peer;
-	struct awg_softc			*sc = peer->p_sc;
+	struct awg_softc		*sc = peer->p_sc;
 	struct awg_pkt_initiation	 pkt;
 	uint8_t				*buf;
 	size_t				 total;
@@ -1626,8 +1626,8 @@ awg_handshake_worker(void *_sc)
 
 /*
  * The following functions handle encapsulation (encryption) and
- * decapsulation (decryption). The wg_{en,de}cap functions will run in the
- * sc_crypt_taskq, while wg_deliver_{in,out} must be serialised and will run
+ * decapsulation (decryption). The awg_{en,de}cap functions will run in the
+ * sc_crypt_taskq, while awg_deliver_{in,out} must be serialised and will run
  * in nettq.
  *
  * The packets are tracked in two queues, a serial queue and a parallel queue.
@@ -1635,7 +1635,7 @@ awg_handshake_worker(void *_sc)
  *    threads.
  *  - The serial queue ensures that packets are not reordered and are
  *    delivered in sequence.
- * The wg_tag attached to the packet contains two flags to help the two queues
+ * The awg_tag attached to the packet contains two flags to help the two queues
  * interact.
  *  - t_done: The parallel queue has finished with the packet, now the serial
  *            queue can do it's work.
@@ -1644,7 +1644,7 @@ awg_handshake_worker(void *_sc)
  *            it is a pointer to the same packet, that has been decrypted and
  *            truncated. If t_mbuf is NULL, then *cryption failed and this
  *            packet should not be passed.
- * wg_{en,de}cap work on the parallel queue, while wg_deliver_{in,out} work
+ * wg_{en,de}cap work on the parallel queue, while awg_deliver_{in,out} work
  * on the serial queue.
  */
 void
@@ -2416,7 +2416,7 @@ awg_ioctl_set(struct awg_softc *sc, struct awg_data_io *data)
 
 	rw_enter_write(&sc->sc_lock);
 
-	iface_p = data->wgd_interface;
+	iface_p = data->awgd_interface;
 	if ((ret = copyin(iface_p, &iface_o, sizeof(iface_o))) != 0)
 		goto error;
 
@@ -2588,10 +2588,10 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 	int			 ret = 0, is_suser = suser(curproc) == 0;
 
 	size = sizeof(struct awg_interface_io);
-	if (data->wgd_size < size && !is_suser)
+	if (data->awgd_size < size && !is_suser)
 		goto ret_size;
 
-	iface_p = data->wgd_interface;
+	iface_p = data->awgd_interface;
 	bzero(&iface_o, sizeof(iface_o));
 
 	rw_enter_read(&sc->sc_lock);
@@ -2617,7 +2617,7 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 
 	size += sizeof(struct awg_peer_io) * sc->sc_peer_num;
 	size += sizeof(struct awg_aip_io) * sc->sc_aip_num;
-	if (data->wgd_size < size)
+	if (data->awgd_size < size)
 		goto unlock_and_ret_size;
 
 	peer_count = 0;
@@ -2685,7 +2685,7 @@ unlock_and_ret_size:
 	explicit_bzero(&iface_o, sizeof(iface_o));
 	explicit_bzero(&peer_o, sizeof(peer_o));
 ret_size:
-	data->wgd_size = size;
+	data->awgd_size = size;
 	return ret;
 }
 
@@ -2978,9 +2978,9 @@ awg_clone_destroy(struct ifnet *ifp)
 }
 
 void
-awgattach(int nwg)
+awgattach(int nawg)
 {
-#ifdef WGTEST
+#ifdef AWGTEST
 	cookie_test();
 	noise_test();
 #endif

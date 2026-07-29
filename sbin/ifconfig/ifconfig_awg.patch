@@ -131,8 +131,8 @@
 +{
 +	if (awgi_interface != NULL)
 +		return;
-+	awgdata.wgd_size = sizeof(*awgi_interface);
-+	awgdata.wgd_interface = awgi_interface = calloc(1, awgdata.wgd_size);
++	awgdata.awgd_size = sizeof(*awgi_interface);
++	awgdata.awgd_interface = awgi_interface = calloc(1, awgdata.awgd_size);
 +	if (awgi_interface == NULL)
 +		err(1, "calloc");
 +}
@@ -143,25 +143,25 @@
 +	ptrdiff_t peer_offset, aip_offset;
 +
 +	if (awgi_interface == NULL)
-+		awgdata.wgd_size = sizeof(*awgi_interface);
++		awgdata.awgd_size = sizeof(*awgi_interface);
 +
 +	peer_offset = (void *)awgi_peer - (void *)awgi_interface;
 +	aip_offset = (void *)awgi_aip - (void *)awgi_interface;
 +
-+	awgdata.wgd_size += by;
-+	awgdata.wgd_interface = realloc(awgi_interface, awgdata.wgd_size);
-+	if (awgdata.wgd_interface == NULL)
++	awgdata.awgd_size += by;
++	awgdata.awgd_interface = realloc(awgi_interface, awgdata.awgd_size);
++	if (awgdata.awgd_interface == NULL)
 +		err(1, "calloc");
 +	if (awgi_interface == NULL)
-+		bzero(awgdata.wgd_interface, sizeof(*awgi_interface));
-+	awgi_interface = awgdata.wgd_interface;
++		bzero(awgdata.awgd_interface, sizeof(*awgi_interface));
++	awgi_interface = awgdata.awgd_interface;
 +
 +	if (awgi_peer != NULL)
 +		awgi_peer = (void *)awgi_interface + peer_offset;
 +	if (awgi_aip != NULL)
 +		awgi_aip = (void *)awgi_interface + aip_offset;
 +
-+	bzero((char *)awgi_interface + awgdata.wgd_size - by, by);
++	bzero((char *)awgi_interface + awgdata.awgd_size - by, by);
 +}
 +
 +void
@@ -417,10 +417,10 @@
 +process_awg_commands(void)
 +{
 +	if (actions & A_AMNEZIAWG) {
-+		strlcpy(awgdata.wgd_name, ifname, sizeof(awgdata.wgd_name));
++		strlcpy(awgdata.awgd_name, ifname, sizeof(awgdata.awgd_name));
 +
 +		if (ioctl(sock, SIOCSAWG, (caddr_t)&awgdata) == -1)
-+			err(1, "%s: SIOCSAWG", awgdata.wgd_name);
++			err(1, "%s: SIOCSAWG", awgdata.awgd_name);
 +	}
 +}
 +
@@ -432,23 +432,23 @@
 +	char			 hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
 +	char			 key[AWG_BASE64_KEY_LEN + 1];
 +
-+	strlcpy(awgdata.wgd_name, ifname, sizeof(awgdata.wgd_name));
-+	awgdata.wgd_size = 0;
-+	awgdata.wgd_interface = NULL;
-+	for (last_size = awgdata.wgd_size;; last_size = awgdata.wgd_size) {
++	strlcpy(awgdata.awgd_name, ifname, sizeof(awgdata.awgd_name));
++	awgdata.awgd_size = 0;
++	awgdata.awgd_interface = NULL;
++	for (last_size = awgdata.awgd_size;; last_size = awgdata.awgd_size) {
 +		if (ioctl(sock, SIOCGAWG, (caddr_t)&awgdata) < 0) {
 +			if (errno == ENOTTY)
 +				goto out;
-+			err(1, "%s: SIOCGAWG", awgdata.wgd_name);
++			err(1, "%s: SIOCGAWG", awgdata.awgd_name);
 +		}
-+		if (last_size >= awgdata.wgd_size)
++		if (last_size >= awgdata.awgd_size)
 +			break;
-+		awgdata.wgd_interface = realloc(awgdata.wgd_interface,
-+		    awgdata.wgd_size);
-+		if (!awgdata.wgd_interface)
++		awgdata.awgd_interface = realloc(awgdata.awgd_interface,
++		    awgdata.awgd_size);
++		if (!awgdata.awgd_interface)
 +			err(1, "realloc");
 +	}
-+	awgi_interface = awgdata.wgd_interface;
++	awgi_interface = awgdata.awgd_interface;
 +
 +	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_PORT)
 +		printf("\tawgport %hu\n", awgi_interface->i_port);
@@ -520,7 +520,7 @@
 +		}
 +	}
 +out:
-+	free(awgdata.wgd_interface);
++	free(awgdata.awgd_interface);
 +}
 +
  

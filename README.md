@@ -104,6 +104,15 @@ doas awg-quick down myvpn
 
 `awg-quick` configures the tunnel entirely via `ifconfig`. If the config filename matches an `awgN` pattern (e.g. `awg0.conf`), that interface is used directly; otherwise the next free `awg0`, `awg1`, … is allocated.
 
+### Show tunnel status
+
+```sh
+doas awg-quick show          # all active awg interfaces
+doas awg-quick show myvpn    # a specific tunnel
+```
+
+Output is `wg show`-style: listening port, public key, all AWG obfuscation parameters, and per-peer endpoint, allowed IPs, latest handshake, transfer counters and keepalive.
+
 ### Inspect the tunnel
 
 ```sh

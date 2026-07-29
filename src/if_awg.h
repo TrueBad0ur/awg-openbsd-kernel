@@ -111,9 +111,9 @@ struct awg_interface_io {
 };
 
 struct awg_data_io {
-	char			 wgd_name[IFNAMSIZ];
-	size_t			 wgd_size;
-	struct awg_interface_io	*wgd_interface;
+	char			 awgd_name[IFNAMSIZ];
+	size_t			 awgd_size;
+	struct awg_interface_io	*awgd_interface;
 };
 
 #endif /* __IF_AWG_H__ */
