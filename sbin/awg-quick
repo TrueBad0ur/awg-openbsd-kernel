@@ -32,7 +32,14 @@ PRE_DOWN=( )
 POST_DOWN=( )
 
 # AWG obfuscation fields
+VERSION=""
 JC="" JMIN="" JMAX="" S1="" S2="" H1="" H2="" H3="" H4=""
+# AWG 3.1 fields
+S3="" S4="" HPK="" CPA="" RANDOM_TRAILERS="" DISABLE_COOKIES=""
+REKEY_AFTER_TIME="" REKEY_TIMEOUT="" REJECT_AFTER_TIME=""
+KEEPALIVE_TIMEOUT="" MAX_HANDSHAKE_ATTEMPTS=""
+ISPECS=( "" "" "" "" "" )
+AWG31_KEYS=( )   # 3.1-only keys found in the config, for Version checks
 
 # [Peer] data — parallel arrays indexed by peer number
 PEER_COUNT=0
@@ -112,6 +119,7 @@ parse_options() {
 			PreDown)               PRE_DOWN+=( "$value" ) ;;
 			PostUp)                POST_UP+=( "$value" ) ;;
 			PostDown)              POST_DOWN+=( "$value" ) ;;
+			Version)               VERSION="$value" ;;
 			Jc)                    JC="$value" ;;
 			Jmin)                  JMIN="$value" ;;
 			Jmax)                  JMAX="$value" ;;
@@ -121,6 +129,26 @@ parse_options() {
 			H2)                    H2="$value" ;;
 			H3)                    H3="$value" ;;
 			H4)                    H4="$value" ;;
+			S3)                    S3="$value" ;;
+			S4)                    S4="$value" ;;
+			I[1-5])                ISPECS[${key:1}-1]="$value" ;;
+			HeaderProtectionKey)   HPK="$value" ;;
+			ContentPaddingAddition) CPA="$value" ;;
+			RekeyAfterTime)        REKEY_AFTER_TIME="$value" ;;
+			RekeyTimeout)          REKEY_TIMEOUT="$value" ;;
+			RejectAfterTime)       REJECT_AFTER_TIME="$value" ;;
+			KeepaliveTimeout)      KEEPALIVE_TIMEOUT="$value" ;;
+			MaxHandshakeAttempts)  MAX_HANDSHAKE_ATTEMPTS="$value" ;;
+			RandomTrailers)        RANDOM_TRAILERS="$value" ;;
+			DisableCookies)        DISABLE_COOKIES="$value" ;;
+			esac
+			case "$key" in
+			S3|S4|I[1-5]|HeaderProtectionKey|ContentPaddingAddition|\
+			RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|\
+			MaxHandshakeAttempts|RandomTrailers|DisableCookies)
+				[[ -n $value ]] && AWG31_KEYS+=( "$key" ) ;;
+			H[1-4])
+				[[ $value == *-* ]] && AWG31_KEYS+=( "$key range" ) ;;
 			esac
 		elif [[ $in_peer -eq 1 ]]; then
 			case "$key" in
@@ -128,7 +156,8 @@ parse_options() {
 			PresharedKey)          cur_psk="$value" ;;
 			Endpoint)              cur_endpoint="$value" ;;
 			AllowedIPs)            cur_aips+="${cur_aips:+ }${value//,/ }" ;;
-			PersistentKeepalive)   cur_pka="$value" ;;
+			PersistentKeepalive)   cur_pka="$value"
+				[[ $value == *-* ]] && AWG31_KEYS+=( "PersistentKeepalive range" ) ;;
 			esac
 		fi
 	done < "$CONFIG_FILE"
@@ -136,6 +165,39 @@ parse_options() {
 	shopt -u nocasematch
 
 	[[ -n $PRIVATE_KEY ]] || die "PrivateKey not set in $CONFIG_FILE"
+
+	# Version: legacy (AmneziaWG < 3.1) or 3.1. Without it, a config
+	# using any 3.1-only parameter selects 3.1.
+	VERSION="${VERSION,,}"
+	case "$VERSION" in
+	"")     [[ ${#AWG31_KEYS[@]} -eq 0 ]] && VERSION=legacy || VERSION=3.1 ;;
+	legacy) [[ ${#AWG31_KEYS[@]} -eq 0 ]] || \
+			die "Version = legacy, but AmneziaWG 3.1 parameters are set: ${AWG31_KEYS[*]}" ;;
+	3.1)    ;;
+	*)      die "Version must be legacy or 3.1, got \`$VERSION'" ;;
+	esac
+
+	# The kernel takes the header protection nonce from the S1-S4 prefixes
+	if [[ -n $HPK ]] && (( ${S1:-0} < 12 || ${S2:-0} < 12 || ${S3:-0} < 12 || ${S4:-0} < 12 )); then
+		die "HeaderProtectionKey requires S1, S2, S3 and S4 of at least 12"
+	fi
+
+	[[ -z $RANDOM_TRAILERS ]] || RANDOM_TRAILERS="$(parse_bool RandomTrailers "$RANDOM_TRAILERS")" || exit 1
+	[[ -z $DISABLE_COOKIES ]] || DISABLE_COOKIES="$(parse_bool DisableCookies "$DISABLE_COOKIES")" || exit 1
+}
+
+# RandomTrailers/DisableCookies: on/off or a number, as in amneziawg-tools
+parse_bool() {
+	local name="$1" value="${2,,}"
+	if [[ $value == on ]]; then
+		echo 1
+	elif [[ $value == off ]]; then
+		echo 0
+	elif [[ $value =~ ^[0-9]+$ ]]; then
+		(( 10#$value != 0 )) && echo 1 || echo 0
+	else
+		die "$name: boolean value is neither on/off nor 0/1: \`$2'"
+	fi
 }
 
 # Find existing awg/wg interface that matches INTERFACE name/description
@@ -204,6 +266,7 @@ set_config() {
 	local args=()
 
 	[[ -n $PRIVATE_KEY ]] || die "no PrivateKey"
+	args+=( awgversion "$VERSION" )
 	args+=( awgkey "$PRIVATE_KEY" )
 	[[ -n $LISTEN_PORT ]] && args+=( awgport "$LISTEN_PORT" )
 
@@ -217,6 +280,29 @@ set_config() {
 	if [[ -n $H1 || -n $H2 || -n $H3 || -n $H4 ]]; then
 		args+=( awgh1 "${H1:-1}" awgh2 "${H2:-2}" awgh3 "${H3:-3}" awgh4 "${H4:-4}" )
 	fi
+
+	# AWG 3.1 params
+	[[ -n $S3 ]] && args+=( awgs3 "$S3" )
+	[[ -n $S4 ]] && args+=( awgs4 "$S4" )
+	local n
+	for (( n=0; n<5; n++ )); do
+		[[ -n ${ISPECS[$n]} ]] && args+=( "awgi$(( n + 1 ))" "${ISPECS[$n]}" )
+	done
+	[[ -n $HPK ]] && args+=( awghpk "$HPK" )
+	[[ -n $CPA ]] && args+=( awgcpa "$CPA" )
+	[[ -n $REKEY_AFTER_TIME ]] && args+=( awgrekeyaftertime "$REKEY_AFTER_TIME" )
+	[[ -n $REKEY_TIMEOUT ]] && args+=( awgrekeytimeout "$REKEY_TIMEOUT" )
+	[[ -n $REJECT_AFTER_TIME ]] && args+=( awgrejectaftertime "$REJECT_AFTER_TIME" )
+	[[ -n $KEEPALIVE_TIMEOUT ]] && args+=( awgkeepalivetimeout "$KEEPALIVE_TIMEOUT" )
+	[[ -n $MAX_HANDSHAKE_ATTEMPTS ]] && args+=( awgmaxhandshakeattempts "$MAX_HANDSHAKE_ATTEMPTS" )
+	case "$RANDOM_TRAILERS" in
+	1) args+=( awgrandomtrailers ) ;;
+	0) args+=( -awgrandomtrailers ) ;;
+	esac
+	case "$DISABLE_COOKIES" in
+	1) args+=( awgdisablecookies ) ;;
+	0) args+=( -awgdisablecookies ) ;;
+	esac
 
 	# Peers
 	local i
@@ -356,7 +442,11 @@ add_route() {
 	local family ifaceroute
 	if [[ $1 == *:* ]]; then
 		family=inet6
-		[[ -n $FIRSTADDR6 ]] || die "Local IPv6 address must be set to have routes"
+		# Provider configs often carry ::/0 without an IPv6 Address
+		if [[ -z $FIRSTADDR6 ]]; then
+			echo "[!] WARNING: no IPv6 Address set, skipping route $1" >&2
+			return 0
+		fi
 		ifaceroute="$FIRSTADDR6"
 	else
 		family=inet
@@ -545,17 +635,41 @@ show_iface() {
 			echo "  listening port: ${BASH_REMATCH[1]}"
 		elif [[ $line =~ ^[[:space:]]+awgpubkey[[:space:]]+([^[:space:]]+) ]]; then
 			echo "  public key: ${BASH_REMATCH[1]}"
+		elif [[ $line =~ ^[[:space:]]+awgversion[[:space:]]+([^[:space:]]+) ]]; then
+			echo "  version: ${BASH_REMATCH[1]}"
 		elif [[ $line =~ ^[[:space:]]+awgjc[[:space:]]+([0-9]+)[[:space:]]+awgjmin[[:space:]]+([0-9]+)[[:space:]]+awgjmax[[:space:]]+([0-9]+) ]]; then
 			echo "  jc: ${BASH_REMATCH[1]}  jmin: ${BASH_REMATCH[2]}  jmax: ${BASH_REMATCH[3]}"
-		elif [[ $line =~ ^[[:space:]]+awgs1[[:space:]]+([0-9]+)[[:space:]]+awgs2[[:space:]]+([0-9]+) ]]; then
-			echo "  s1: ${BASH_REMATCH[1]}  s2: ${BASH_REMATCH[2]}"
-		elif [[ $line =~ ^[[:space:]]+awgh1[[:space:]]+([0-9]+)[[:space:]]+awgh2[[:space:]]+([0-9]+)[[:space:]]+awgh3[[:space:]]+([0-9]+)[[:space:]]+awgh4[[:space:]]+([0-9]+) ]]; then
+		elif [[ $line =~ ^[[:space:]]+awgs1[[:space:]]+([0-9]+)[[:space:]]+awgs2[[:space:]]+([0-9]+)([[:space:]]+awgs3[[:space:]]+([0-9]+)[[:space:]]+awgs4[[:space:]]+([0-9]+))? ]]; then
+			if [[ -n ${BASH_REMATCH[3]} ]]; then
+				echo "  s1: ${BASH_REMATCH[1]}  s2: ${BASH_REMATCH[2]}  s3: ${BASH_REMATCH[4]}  s4: ${BASH_REMATCH[5]}"
+			else
+				echo "  s1: ${BASH_REMATCH[1]}  s2: ${BASH_REMATCH[2]}"
+			fi
+		elif [[ $line =~ ^[[:space:]]+awgh1[[:space:]]+([0-9-]+)[[:space:]]+awgh2[[:space:]]+([0-9-]+)[[:space:]]+awgh3[[:space:]]+([0-9-]+)[[:space:]]+awgh4[[:space:]]+([0-9-]+) ]]; then
 			echo "  h1: ${BASH_REMATCH[1]}  h2: ${BASH_REMATCH[2]}  h3: ${BASH_REMATCH[3]}  h4: ${BASH_REMATCH[4]}"
+		elif [[ $line =~ ^[[:space:]]+awgi([1-5])[[:space:]]+(.*)$ ]]; then
+			echo "  i${BASH_REMATCH[1]}: ${BASH_REMATCH[2]}"
+		elif [[ $line =~ ^[[:space:]]+awghpk ]]; then
+			echo "  header protection key: (hidden)"
+		elif [[ $line =~ ^[[:space:]]+awgcpa[[:space:]]+([0-9-]+) ]]; then
+			echo "  content padding addition: ${BASH_REMATCH[1]}"
+		elif [[ $line =~ ^[[:space:]]+awg(rekeyaftertime|rekeytimeout|rejectaftertime|keepalivetimeout|maxhandshakeattempts)[[:space:]]+([0-9-]+) ]]; then
+			case "${BASH_REMATCH[1]}" in
+			rekeyaftertime)       echo "  rekey after time: ${BASH_REMATCH[2]}" ;;
+			rekeytimeout)         echo "  rekey timeout: ${BASH_REMATCH[2]}" ;;
+			rejectaftertime)      echo "  reject after time: ${BASH_REMATCH[2]}" ;;
+			keepalivetimeout)     echo "  keepalive timeout: ${BASH_REMATCH[2]}" ;;
+			maxhandshakeattempts) echo "  max handshake attempts: ${BASH_REMATCH[2]}" ;;
+			esac
+		elif [[ $line =~ ^[[:space:]]+awgrandomtrailers ]]; then
+			echo "  random trailers: on"
+		elif [[ $line =~ ^[[:space:]]+awgdisablecookies ]]; then
+			echo "  disable cookies: on"
 		elif [[ $line =~ ^[[:space:]]+awgpeer[[:space:]]+([^[:space:]]+) ]]; then
 			_show_flush_peer; _p_key="${BASH_REMATCH[1]}"
 		elif [[ $line =~ ^[[:space:]]+awgpsk ]]; then
 			_p_psk=1
-		elif [[ $line =~ ^[[:space:]]+awgpka[[:space:]]+([0-9]+) ]]; then
+		elif [[ $line =~ ^[[:space:]]+awgpka[[:space:]]+([0-9-]+) ]]; then
 			_p_pka="${BASH_REMATCH[1]}"
 		elif [[ $line =~ ^[[:space:]]+awgendpoint[[:space:]]+([^[:space:]]+)[[:space:]]+([0-9]+) ]]; then
 			_p_ep="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
@@ -599,7 +713,12 @@ cmd_usage() {
 
 	  Supported [Interface] fields: PrivateKey, ListenPort, Address, MTU, DNS,
 	  Table, PreUp, PostUp, PreDown, PostDown,
-	  Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4.
+	  Jc, Jmin, Jmax, S1, S2, H1, H2, H3, H4,
+	  Version (legacy or 3.1; default: 3.1 if any 3.1-only field is set),
+	  AmneziaWG 3.1: S3, S4, H1-H4 ranges, I1-I5, HeaderProtectionKey,
+	  ContentPaddingAddition, RekeyAfterTime, RekeyTimeout, RejectAfterTime,
+	  KeepaliveTimeout, MaxHandshakeAttempts, RandomTrailers, DisableCookies,
+	  PersistentKeepalive ranges.
 
 	  Configures the awg(4) interface entirely via ifconfig(8).
 	_EOF

@@ -83,11 +83,19 @@ install_ifconfig() {
     cp "$REPODIR/src/if_awg.h" /usr/include/net/if_awg.h
 
     # Apply patch (idempotent: check if already patched)
-    if grep -q 'A_AMNEZIAWG' "$IFCFG_SRC/ifconfig.c" 2>/dev/null; then
+    if grep -q 'awgversion' "$IFCFG_SRC/ifconfig.c" 2>/dev/null; then
         log "ifconfig.c already patched"
     else
+        if grep -q 'A_AMNEZIAWG' "$IFCFG_SRC/ifconfig.c" 2>/dev/null; then
+            # Patched by a release without AWG 3.1 support: start over
+            [ -f "$IFCFG_SRC/ifconfig.c.orig" ] \
+                || die "ifconfig.c has an old AWG patch and no ifconfig.c.orig to restore"
+            log "Replacing old AWG patch in ifconfig.c"
+            cp "$IFCFG_SRC/ifconfig.c.orig" "$IFCFG_SRC/ifconfig.c"
+        else
+            cp "$IFCFG_SRC/ifconfig.c" "$IFCFG_SRC/ifconfig.c.orig"
+        fi
         log "Patching ifconfig.c"
-        cp "$IFCFG_SRC/ifconfig.c" "$IFCFG_SRC/ifconfig.c.orig"
         patch "$IFCFG_SRC/ifconfig.c" "$PATCH" \
             || die "patch failed — ifconfig.c may differ from expected version"
     fi
@@ -96,7 +104,8 @@ install_ifconfig() {
     log "Building ifconfig"
     cd "$IFCFG_SRC"
     make || die "ifconfig build failed"
-    install -c -s -o root -g bin -m 555 ifconfig /sbin/ifconfig
+    # The binary is in obj/ if that exists
+    install -c -s -o root -g bin -m 555 "$(make -V .OBJDIR)/ifconfig" /sbin/ifconfig
     install -c -o root -g bin -m 444 ifconfig.8 /usr/share/man/man8/ifconfig.8
     log "ifconfig installed to /sbin/ifconfig"
 }
@@ -116,9 +125,11 @@ install_kernel() {
     step "AWG kernel driver"
 
     log "Copying driver files to $SRCDIR/net/"
-    cp "$REPODIR/src/if_awg.h" "$SRCDIR/net/if_awg.h"
-    cp "$REPODIR/src/if_awg.c" "$SRCDIR/net/if_awg.c"
-    cp "$REPODIR/src/AWG.MP"   "$SRCDIR/arch/amd64/conf/AWG.MP"
+    cp "$REPODIR/src/if_awg.h"    "$SRCDIR/net/if_awg.h"
+    cp "$REPODIR/src/if_awg.c"    "$SRCDIR/net/if_awg.c"
+    cp "$REPODIR/src/awg_noise.h" "$SRCDIR/net/awg_noise.h"
+    cp "$REPODIR/src/awg_noise.c" "$SRCDIR/net/awg_noise.c"
+    cp "$REPODIR/src/AWG.MP"      "$SRCDIR/arch/amd64/conf/AWG.MP"
 
     # Patch conf/files to register the pseudo-device (idempotent)
     if grep -q 'pseudo-device awg' "$SRCDIR/conf/files"; then
@@ -133,6 +144,18 @@ install_kernel() {
             && mv "$SRCDIR/conf/files.tmp" "$SRCDIR/conf/files"
         grep -q 'pseudo-device awg' "$SRCDIR/conf/files" \
             || die "conf/files patch failed — wg entry not found"
+    fi
+
+    # awg_noise.c came with AWG 3.1 support, add it to older installs too
+    if ! grep -q 'net/awg_noise\.c' "$SRCDIR/conf/files"; then
+        log "Registering net/awg_noise.c in $SRCDIR/conf/files"
+        awk '
+            /^file net\/if_awg\.c/ { print; print "file net/awg_noise.c\t\t\tawg"; next }
+            { print }
+        ' "$SRCDIR/conf/files" > "$SRCDIR/conf/files.tmp" \
+            && mv "$SRCDIR/conf/files.tmp" "$SRCDIR/conf/files"
+        grep -q 'net/awg_noise\.c' "$SRCDIR/conf/files" \
+            || die "conf/files patch failed — if_awg.c entry not found"
     fi
 
     log "Configuring AWG.MP"

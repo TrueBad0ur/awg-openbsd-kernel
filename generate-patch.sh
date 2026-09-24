@@ -25,6 +25,10 @@ patch_file "$REPODIR/src/if_awg.h" "net/if_awg.h"   >> "$OUT"
 printf '\n'                                           >> "$OUT"
 patch_file "$REPODIR/src/if_awg.c" "net/if_awg.c"   >> "$OUT"
 printf '\n'                                          >> "$OUT"
+patch_file "$REPODIR/src/awg_noise.h" "net/awg_noise.h" >> "$OUT"
+printf '\n'                                              >> "$OUT"
+patch_file "$REPODIR/src/awg_noise.c" "net/awg_noise.c" >> "$OUT"
+printf '\n'                                              >> "$OUT"
 
 cat >> "$OUT" <<EOF
 --- sys/conf/files.orig
@@ -33,6 +37,7 @@ cat >> "$OUT" <<EOF
 +pseudo-device awg: ifnet
 @@ file net/if_wg.c
 +file net/if_awg.c${TAB}${TAB}${TAB}awg
++file net/awg_noise.c${TAB}${TAB}${TAB}awg
 EOF
 
 echo "Generated $OUT ($(wc -l < "$OUT" | tr -d ' ') lines)"

@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_awg.c,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
+/*	$OpenBSD: if_awg.c,v 1.1 2026/09/24 00:00:00 truebad0ur Exp $ */
 
 /*
  * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
@@ -7,7 +7,9 @@
  *
  * AmneziaWG kernel driver for OpenBSD.
  * Based on if_wg.c (WireGuard driver) from OpenBSD src/sys/net/.
- * Adds obfuscation parameters: Jc, Jmin, Jmax, S1, S2, H1-H4.
+ * Adds obfuscation parameters: Jc, Jmin, Jmax, S1, S2, H1-H4 (legacy) and
+ * the AmneziaWG 3.1 set: S3, S4, H1-H4 ranges, I1-I5, HeaderProtectionKey,
+ * ContentPaddingAddition, timings, RandomTrailers, DisableCookies.
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -43,7 +45,7 @@
 #include <net/if_types.h>
 #include <net/if_awg.h>
 
-#include <net/wg_noise.h>
+#include <net/awg_noise.h>
 #include <net/wg_cookie.h>
 
 #include <net/pfvar.h>
@@ -57,6 +59,7 @@
 #include <netinet/in_pcb.h>
 
 #include <crypto/siphash.h>
+#include <crypto/chacha_private.h>
 
 #define DEFAULT_MTU		1420
 
@@ -74,8 +77,10 @@
 #define REKEY_TIMEOUT_JITTER	334 /* 1/3 sec, round for arc4random_uniform */
 #define KEEPALIVE_TIMEOUT	10
 #define MAX_TIMER_HANDSHAKES	(90 / REKEY_TIMEOUT)
-#define NEW_HANDSHAKE_TIMEOUT	(REKEY_TIMEOUT + KEEPALIVE_TIMEOUT)
 #define UNDERLOAD_TIMEOUT	1
+
+#define AWG_DEFAULT_UDP_WINDOW	500	/* initial peer UDP window, 3.1 */
+#define AWG_MAX_UDP_PAYLOAD	65507
 
 #define AWGPRINTF(loglevel, sc, mtx, fmt, ...) do {		\
 	if (ISSET((sc)->sc_if.if_flags, IFF_DEBUG)) {		\
@@ -92,14 +97,11 @@
 	const __typeof( ((type *)0)->member ) *__mptr = (ptr);	\
 	(type *)( (char *)__mptr - offsetof(type,member) );})
 
-/* First byte indicating packet type on the wire */
-#define AWG_PKT_INITIATION htole32(1)
-#define AWG_PKT_RESPONSE htole32(2)
-#define AWG_PKT_COOKIE htole32(3)
-#define AWG_PKT_DATA htole32(4)
-
 #define AWG_PKT_WITH_PADDING(n)	(((n) + (16-1)) & (~(16-1)))
 #define AWG_KEY_SIZE		AWG_KEY_LEN
+
+/* Smallest transport message: header + auth tag of empty payload */
+#define AWG_MIN_DATA_SIZE	(sizeof(struct awg_pkt_data) + NOISE_AUTHTAG_LEN)
 
 struct awg_pkt_initiation {
 	uint32_t		t;
@@ -156,13 +158,42 @@ struct awg_tag {
 	struct mbuf		*t_mbuf;
 	int			 t_done;
 	int			 t_mtu;
+	int			 t_type;	/* AWG_TYPE_*, set by awg_input */
+};
+
+/* Message types, decoded from the H1-H4 ranges */
+#define AWG_TYPE_INITIATION	1
+#define AWG_TYPE_RESPONSE	2
+#define AWG_TYPE_COOKIE		3
+#define AWG_TYPE_DATA		4
+
+/* I1-I5 packet: static bytes with regions rewritten on each send */
+#define AWG_ISPEC_MOD_COUNTER	1	/* <c> */
+#define AWG_ISPEC_MOD_TIME	2	/* <t> */
+#define AWG_ISPEC_MOD_RAND	3	/* <r N> */
+#define AWG_ISPEC_MOD_CHARS	4	/* <rc N> */
+#define AWG_ISPEC_MOD_DIGITS	5	/* <rd N> */
+
+struct awg_ispec_mod {
+	int			 im_type;
+	size_t			 im_off;
+	size_t			 im_len;
+};
+
+struct awg_ispec {
+	char			*is_desc;	/* tag string as configured */
+	size_t			 is_desc_size;
+	uint8_t			*is_pkt;
+	size_t			 is_pkt_len;
+	struct awg_ispec_mod	*is_mods;
+	size_t			 is_mods_count;
 };
 
 struct awg_index {
 	LIST_ENTRY(awg_index)	 i_entry;
 	SLIST_ENTRY(awg_index)	 i_unused_entry;
 	uint32_t		 i_key;
-	struct noise_remote	*i_value;
+	struct awg_noise_remote	*i_value;
 };
 
 struct awg_timers {
@@ -172,6 +203,7 @@ struct awg_timers {
 	int			 t_disabled;
 	int			 t_need_another_keepalive;
 	uint16_t		 t_persistent_keepalive_interval;
+	uint16_t		 t_persistent_keepalive_hi;	/* range, 3.1 */
 	struct timeout		 t_new_handshake;
 	struct timeout		 t_send_keepalive;
 	struct timeout		 t_retry_handshake;
@@ -182,6 +214,7 @@ struct awg_timers {
 	struct timespec		 t_handshake_last_sent;	/* nanouptime */
 	struct timespec		 t_handshake_complete;	/* nanotime */
 	int			 t_handshake_retries;
+	int			 t_max_handshake_retries;
 };
 
 struct awg_aip {
@@ -209,7 +242,7 @@ struct awg_peer {
 	uint64_t		 p_id;
 	struct awg_softc		*p_sc;
 
-	struct noise_remote	 p_remote;
+	struct awg_noise_remote	 p_remote;
 	struct cookie_maker	 p_cookie;
 	struct awg_timers	 p_timers;
 
@@ -219,6 +252,7 @@ struct awg_peer {
 
 	struct mutex		 p_endpoint_mtx;
 	struct awg_endpoint	 p_endpoint;
+	uint32_t		 p_udp_window;	/* largest datagram seen, 3.1 */
 
 	struct task		 p_send_initiation;
 	struct task		 p_send_keepalive;
@@ -246,7 +280,7 @@ struct awg_softc {
 	SIPHASH_KEY		 sc_secret;
 
 	struct rwlock		 sc_lock;
-	struct noise_local	 sc_local;
+	struct awg_noise_local	 sc_local;
 	struct cookie_checker	 sc_cookie;
 	in_port_t		 sc_udp_port;
 	int			 sc_udp_rtable;
@@ -282,16 +316,36 @@ struct awg_softc {
 	struct awg_ring		 sc_encap_ring;
 	struct awg_ring		 sc_decap_ring;
 
-	/* AmneziaWG obfuscation parameters (defaults = standard WireGuard) */
+	/*
+	 * AmneziaWG obfuscation parameters (defaults = standard WireGuard).
+	 * Written under sc_lock, read without locking by the packet path;
+	 * a packet racing a reconfiguration may be dropped.
+	 */
+	int			 sc_awg_version;	/* AWG_VERSION_* */
 	uint16_t		 sc_awg_jc;
 	uint16_t		 sc_awg_jmin;
 	uint16_t		 sc_awg_jmax;
 	uint16_t		 sc_awg_s1;
 	uint16_t		 sc_awg_s2;
-	uint32_t		 sc_awg_h1;
-	uint32_t		 sc_awg_h2;
-	uint32_t		 sc_awg_h3;
-	uint32_t		 sc_awg_h4;
+	uint16_t		 sc_awg_s3;
+	uint16_t		 sc_awg_s4;
+	struct awg_range	 sc_awg_h1;
+	struct awg_range	 sc_awg_h2;
+	struct awg_range	 sc_awg_h3;
+	struct awg_range	 sc_awg_h4;
+	int			 sc_awg_has_hpk;
+	uint8_t			 sc_awg_hpk[AWG_HPK_LEN];
+	struct awg_range	 sc_awg_cpa;
+	struct awg_range	 sc_awg_rekey_after_time;
+	struct awg_range	 sc_awg_rekey_timeout;
+	struct awg_range	 sc_awg_reject_after_time;
+	struct awg_range	 sc_awg_keepalive_timeout;
+	struct awg_range	 sc_awg_max_handshake_attempts;
+	int			 sc_awg_random_trailers;
+	int			 sc_awg_disable_cookies;
+
+	struct rwlock		 sc_ispec_lock;
+	struct awg_ispec	 sc_awg_ispec[AWG_ISPEC_COUNT];
 };
 
 struct awg_peer *
@@ -326,8 +380,10 @@ struct awg_tag *
 void	awg_timers_init(struct awg_timers *);
 void	awg_timers_enable(struct awg_timers *);
 void	awg_timers_disable(struct awg_timers *);
-void	awg_timers_set_persistent_keepalive(struct awg_timers *, uint16_t);
-int	awg_timers_get_persistent_keepalive(struct awg_timers *, uint16_t *);
+void	awg_timers_set_persistent_keepalive(struct awg_timers *, uint16_t,
+	    uint16_t);
+int	awg_timers_get_persistent_keepalive(struct awg_timers *, uint16_t *,
+	    uint16_t *);
 void	awg_timers_get_last_handshake(struct awg_timers *, struct timespec *);
 int	awg_timers_expired_handshake_last_sent(struct awg_timers *);
 int	awg_timers_check_handshake_last_sent(struct awg_timers *);
@@ -351,7 +407,34 @@ void	awg_timers_run_new_handshake(void *);
 void	awg_timers_run_zero_key_material(void *);
 void	awg_timers_run_persistent_keepalive(void *);
 
+uint32_t
+	awg_range_pick(struct awg_range);
+int	awg_range_contains(struct awg_range, uint32_t);
+int	awg_range_is_zero(struct awg_range);
+int	awg_range_overlap(struct awg_range, struct awg_range);
+int	awg_rekey_timeout(struct awg_softc *);
+int	awg_rekey_min_timeout(struct awg_softc *);
+int	awg_keepalive_timeout(struct awg_softc *);
+int	awg_new_handshake_timeout(struct awg_softc *);
+int	awg_keychain_expire_time(struct awg_softc *);
+int	awg_max_handshake_attempts(struct awg_softc *);
+void	awg_update_noise_timings(struct awg_softc *);
+
+int	awg_hp_init(struct awg_softc *, chacha_ctx *,
+	    const uint8_t[AWG_HPK_NONCE_LEN]);
+size_t	awg_random_trailer(struct awg_softc *, uint32_t, size_t);
+size_t	awg_content_padding(struct awg_softc *, uint32_t, size_t);
+void	awg_peer_update_udp_window(struct awg_peer *, uint32_t);
+
+static int
+	awg_hexval(int);
+int	awg_ispec_parse(struct awg_ispec *, const char *);
+void	awg_ispec_free(struct awg_ispec *);
+void	awg_send_ispecs(struct awg_softc *, struct awg_peer *);
+
 void	awg_peer_send_buf(struct awg_peer *, uint8_t *, size_t);
+void	awg_send_hs(struct awg_softc *, struct awg_peer *,
+	    struct awg_endpoint *, void *, size_t, uint16_t);
 void	awg_send_junk(struct awg_softc *, struct awg_peer *);
 void	awg_send_initiation(void *);
 void	awg_send_response(struct awg_peer *);
@@ -376,19 +459,23 @@ struct mbuf *
 struct mbuf *
 	awg_queue_dequeue(struct awg_queue *, struct awg_tag **);
 
-struct noise_remote *
+struct awg_noise_remote *
 	awg_remote_get(void *, uint8_t[NOISE_PUBLIC_KEY_LEN]);
 uint32_t
-	awg_index_set(void *, struct noise_remote *);
-struct noise_remote *
+	awg_index_set(void *, struct awg_noise_remote *);
+struct awg_noise_remote *
 	awg_index_get(void *, uint32_t);
 void	awg_index_drop(void *, uint32_t);
 
+int	awg_classify(struct awg_softc *, struct mbuf *, size_t *, size_t *,
+	    uint8_t[AWG_HPK_NONCE_LEN], int *);
 struct mbuf *
 	awg_input(void *, struct mbuf *, struct ip *, struct ip6_hdr *, void *,
 	    int, struct netstack *);
 int	awg_output(struct ifnet *, struct mbuf *, struct sockaddr *,
 	    struct rtentry *);
+int	awg_ioctl_check(struct awg_softc *, struct awg_interface_io *);
+void	awg_reset_3_1(struct awg_softc *, struct awg_ispec[AWG_ISPEC_COUNT]);
 int	awg_ioctl_set(struct awg_softc *, struct awg_data_io *);
 int	awg_ioctl_get(struct awg_softc *, struct awg_data_io *);
 int	awg_ioctl(struct ifnet *, u_long, caddr_t);
@@ -429,7 +516,7 @@ awg_peer_create(struct awg_softc *sc, uint8_t public[AWG_KEY_SIZE])
 	peer->p_id = awg_peer_counter++;
 	peer->p_sc = sc;
 
-	noise_remote_init(&peer->p_remote, public, &sc->sc_local);
+	awg_noise_remote_init(&peer->p_remote, public, &sc->sc_local);
 	cookie_maker_init(&peer->p_cookie, public);
 	awg_timers_init(&peer->p_timers);
 
@@ -441,6 +528,7 @@ awg_peer_create(struct awg_softc *sc, uint8_t public[AWG_KEY_SIZE])
 
 	mtx_init(&peer->p_endpoint_mtx, IPL_NET);
 	bzero(&peer->p_endpoint, sizeof(peer->p_endpoint));
+	peer->p_udp_window = AWG_DEFAULT_UDP_WINDOW;
 
 	task_set(&peer->p_send_initiation, awg_send_initiation, peer);
 	task_set(&peer->p_send_keepalive, awg_send_keepalive, peer);
@@ -491,7 +579,7 @@ awg_peer_lookup(struct awg_softc *sc, const uint8_t public[AWG_KEY_SIZE])
 
 	rw_enter_read(&sc->sc_peer_lock);
 	LIST_FOREACH(peer, &sc->sc_peer[idx], p_pubkey_entry) {
-		noise_remote_keys(&peer->p_remote, peer_key, NULL);
+		awg_noise_remote_keys(&peer->p_remote, peer_key, NULL);
 		if (timingsafe_bcmp(peer_key, public, AWG_KEY_SIZE) == 0)
 			goto done;
 	}
@@ -533,7 +621,7 @@ awg_peer_destroy(struct awg_peer *peer)
 	LIST_FOREACH_SAFE(aip, &peer->p_aip, a_entry, taip)
 		awg_aip_remove(sc, peer, &aip->a_data);
 
-	noise_remote_clear(&peer->p_remote);
+	awg_noise_remote_clear(&peer->p_remote);
 
 	NET_LOCK();
 	while (!ifq_empty(&sc->sc_if.if_snd)) {
@@ -571,6 +659,7 @@ awg_peer_set_endpoint_from_tag(struct awg_peer *peer, struct awg_tag *t)
 
 	mtx_enter(&peer->p_endpoint_mtx);
 	peer->p_endpoint = t->t_endpoint;
+	peer->p_udp_window = AWG_DEFAULT_UDP_WINDOW;
 	mtx_leave(&peer->p_endpoint_mtx);
 }
 
@@ -581,6 +670,7 @@ awg_peer_set_sockaddr(struct awg_peer *peer, struct sockaddr *remote)
 	memcpy(&peer->p_endpoint.e_remote, remote,
 	       sizeof(peer->p_endpoint.e_remote));
 	bzero(&peer->p_endpoint.e_local, sizeof(peer->p_endpoint.e_local));
+	peer->p_udp_window = AWG_DEFAULT_UDP_WINDOW;
 	mtx_leave(&peer->p_endpoint_mtx);
 }
 
@@ -947,6 +1037,281 @@ awg_tag_get(struct mbuf *m)
 }
 
 /*
+ * AmneziaWG helpers. Ranges are inclusive; the timing ranges are unset
+ * (WireGuard default) when both ends are zero.
+ */
+uint32_t
+awg_range_pick(struct awg_range r)
+{
+	if (r.r_hi <= r.r_lo)
+		return r.r_lo;
+	if (r.r_lo == 0 && r.r_hi == UINT32_MAX)
+		return arc4random();
+	return r.r_lo + arc4random_uniform(r.r_hi - r.r_lo + 1);
+}
+
+int
+awg_range_contains(struct awg_range r, uint32_t v)
+{
+	return r.r_lo <= v && v <= r.r_hi;
+}
+
+int
+awg_range_is_zero(struct awg_range r)
+{
+	return r.r_lo == 0 && r.r_hi == 0;
+}
+
+int
+awg_range_overlap(struct awg_range a, struct awg_range b)
+{
+	return a.r_lo <= b.r_hi && b.r_lo <= a.r_hi;
+}
+
+int
+awg_rekey_timeout(struct awg_softc *sc)
+{
+	struct awg_range r = sc->sc_awg_rekey_timeout;
+	return awg_range_is_zero(r) ? REKEY_TIMEOUT : awg_range_pick(r);
+}
+
+int
+awg_rekey_min_timeout(struct awg_softc *sc)
+{
+	struct awg_range r = sc->sc_awg_rekey_timeout;
+	return awg_range_is_zero(r) ? REKEY_TIMEOUT : r.r_lo;
+}
+
+int
+awg_keepalive_timeout(struct awg_softc *sc)
+{
+	struct awg_range r = sc->sc_awg_keepalive_timeout;
+	return awg_range_is_zero(r) ? KEEPALIVE_TIMEOUT : awg_range_pick(r);
+}
+
+int
+awg_new_handshake_timeout(struct awg_softc *sc)
+{
+	struct awg_range r = sc->sc_awg_keepalive_timeout;
+	return (awg_range_is_zero(r) ? KEEPALIVE_TIMEOUT : r.r_hi) +
+	    awg_rekey_timeout(sc);
+}
+
+int
+awg_keychain_expire_time(struct awg_softc *sc)
+{
+	struct awg_range r = sc->sc_awg_reject_after_time;
+	return awg_range_is_zero(r) ? REJECT_AFTER_TIME : r.r_hi;
+}
+
+int
+awg_max_handshake_attempts(struct awg_softc *sc)
+{
+	struct awg_range r = sc->sc_awg_max_handshake_attempts;
+	return awg_range_is_zero(r) ? MAX_TIMER_HANDSHAKES : awg_range_pick(r);
+}
+
+void
+awg_update_noise_timings(struct awg_softc *sc)
+{
+	struct awg_range ka = sc->sc_awg_keepalive_timeout;
+	struct awg_range rt = sc->sc_awg_rekey_timeout;
+
+	/* REKEY_AFTER_TIME_RECV = RejectAfterTime - KeepaliveTimeout -
+	 * RekeyTimeout, as keyRefreshTimeoutReceiving in amneziawg-go */
+	awg_noise_local_set_timings(&sc->sc_local,
+	    sc->sc_awg_rekey_after_time.r_lo, sc->sc_awg_rekey_after_time.r_hi,
+	    sc->sc_awg_reject_after_time.r_lo, sc->sc_awg_reject_after_time.r_hi,
+	    (awg_range_is_zero(ka) ? KEEPALIVE_TIMEOUT : ka.r_lo) +
+	    (awg_range_is_zero(rt) ? REKEY_TIMEOUT : rt.r_lo));
+}
+
+/*
+ * Header protection: ChaCha20 (IETF, 96-bit nonce, counter 0) keyed with
+ * HeaderProtectionKey, the nonce being the first 12 bytes of the random
+ * S1-S4 prefix. chacha_private.h implements the 64-bit nonce variant, so
+ * the first nonce word goes into the upper half of the block counter.
+ */
+int
+awg_hp_init(struct awg_softc *sc, chacha_ctx *ctx,
+    const uint8_t nonce[AWG_HPK_NONCE_LEN])
+{
+	uint8_t counter[8] = { 0 };
+
+	if (!sc->sc_awg_has_hpk)
+		return 0;
+	chacha_keysetup(ctx, sc->sc_awg_hpk, AWG_HPK_LEN * 8);
+	memcpy(counter + 4, nonce, 4);
+	chacha_ivsetup(ctx, nonce + 4, counter);
+	return 1;
+}
+
+/* RandomTrailers: random tail keeping the datagram within the UDP window */
+size_t
+awg_random_trailer(struct awg_softc *sc, uint32_t window, size_t size)
+{
+	if (!sc->sc_awg_random_trailers || window <= size)
+		return 0;
+	return arc4random_uniform(window - size);
+}
+
+size_t
+awg_content_padding(struct awg_softc *sc, uint32_t window, size_t size)
+{
+	size_t add;
+
+	if (window < size)
+		return 0;
+	add = awg_range_pick(sc->sc_awg_cpa);
+	return MIN(add, window - size);
+}
+
+void
+awg_peer_update_udp_window(struct awg_peer *peer, uint32_t size)
+{
+	/* Racy on purpose, the window only grows and is advisory */
+	if (peer->p_udp_window < size)
+		peer->p_udp_window = size;
+}
+
+/*
+ * I1-I5: parse "<b 0xHEX><c><t><r N><rc N><rd N>" into a static packet
+ * plus the regions to regenerate before each send. Text outside the tags
+ * is ignored, as in amneziawg-go.
+ */
+static int
+awg_hexval(int c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+int
+awg_ispec_parse(struct awg_ispec *is, const char *desc)
+{
+	struct awg_ispec_mod	*mods = NULL;
+	const char		*p, *end, *key, *val;
+	uint8_t			*pkt = NULL;
+	size_t			 keylen, vallen, len, i;
+	size_t			 nmods = 0, pktlen = 0, mods_size = 0, pkt_size = 0;
+	int			 pass, type;
+
+	bzero(is, sizeof(*is));
+
+	/* Pass 0 validates and computes sizes, pass 1 fills the buffers */
+	for (pass = 0; pass < 2; pass++) {
+		if (pass == 1) {
+			if (pktlen == 0)
+				return 0;
+			pkt_size = pktlen;
+			mods_size = nmods;
+			pkt = malloc(pkt_size, M_DEVBUF, M_WAITOK | M_ZERO);
+			if (mods_size > 0)
+				mods = mallocarray(mods_size, sizeof(*mods),
+				    M_DEVBUF, M_WAITOK | M_ZERO);
+			pktlen = nmods = 0;
+		}
+		for (p = desc; (p = strchr(p, '<')) != NULL; p = end + 1) {
+			if ((end = strchr(p, '>')) == NULL)
+				return EINVAL;
+			for (key = p + 1; key < end && *key == ' '; key++)
+				;
+			for (keylen = 0; key + keylen < end &&
+			    key[keylen] != ' '; keylen++)
+				;
+			for (val = key + keylen; val < end && *val == ' '; val++)
+				;
+			for (vallen = 0; val + vallen < end &&
+			    val[vallen] != ' '; vallen++)
+				;
+
+			type = 0;
+			len = 0;
+			if (keylen == 1 && key[0] == 'b') {
+				if (vallen >= 2 && val[0] == '0' &&
+				    (val[1] == 'x' || val[1] == 'X')) {
+					val += 2;
+					vallen -= 2;
+				}
+				if (vallen == 0 || vallen % 2 != 0)
+					return EINVAL;
+				for (i = 0; i < vallen; i++)
+					if (awg_hexval(val[i]) < 0)
+						return EINVAL;
+				len = vallen / 2;
+				if (pass == 1)
+					for (i = 0; i < len; i++)
+						pkt[pktlen + i] =
+						    awg_hexval(val[2 * i]) << 4 |
+						    awg_hexval(val[2 * i + 1]);
+			} else if (keylen == 1 && key[0] == 'c') {
+				type = AWG_ISPEC_MOD_COUNTER;
+				len = sizeof(uint32_t);
+			} else if (keylen == 1 && key[0] == 't') {
+				type = AWG_ISPEC_MOD_TIME;
+				len = sizeof(uint32_t);
+			} else if ((keylen == 1 && key[0] == 'r') ||
+			    (keylen == 2 && key[0] == 'r' &&
+			    (key[1] == 'c' || key[1] == 'd'))) {
+				type = keylen == 1 ? AWG_ISPEC_MOD_RAND :
+				    key[1] == 'c' ? AWG_ISPEC_MOD_CHARS :
+				    AWG_ISPEC_MOD_DIGITS;
+				if (vallen == 0)
+					return EINVAL;
+				for (i = 0; i < vallen; i++) {
+					if (val[i] < '0' || val[i] > '9')
+						return EINVAL;
+					len = len * 10 + (val[i] - '0');
+					if (len > AWG_MAX_UDP_PAYLOAD)
+						return EINVAL;
+				}
+			} else {
+				return EINVAL;
+			}
+
+			if (pktlen + len > AWG_MAX_UDP_PAYLOAD)
+				return EINVAL;
+			if (type != 0) {
+				if (pass == 1) {
+					mods[nmods].im_type = type;
+					mods[nmods].im_off = pktlen;
+					mods[nmods].im_len = len;
+				}
+				nmods++;
+			}
+			pktlen += len;
+		}
+	}
+
+	is->is_desc_size = strlen(desc) + 1;
+	is->is_desc = malloc(is->is_desc_size, M_DEVBUF, M_WAITOK);
+	memcpy(is->is_desc, desc, is->is_desc_size);
+	is->is_pkt = pkt;
+	is->is_pkt_len = pkt_size;
+	is->is_mods = mods;
+	is->is_mods_count = mods_size;
+	return 0;
+}
+
+void
+awg_ispec_free(struct awg_ispec *is)
+{
+	if (is->is_desc != NULL)
+		free(is->is_desc, M_DEVBUF, is->is_desc_size);
+	if (is->is_pkt != NULL)
+		free(is->is_pkt, M_DEVBUF, is->is_pkt_len);
+	if (is->is_mods != NULL)
+		free(is->is_mods, M_DEVBUF,
+		    is->is_mods_count * sizeof(*is->is_mods));
+	bzero(is, sizeof(*is));
+}
+
+/*
  * The following section handles the timeout callbacks for a WireGuard session.
  * These functions provide an "event based" model for controlling awg(4) session
  * timers. All function calls occur after the specified event below.
@@ -980,6 +1345,7 @@ awg_timers_init(struct awg_timers *t)
 	bzero(t, sizeof(*t));
 	mtx_init_flags(&t->t_mtx, IPL_NET, "awg_timers", 0);
 	mtx_init(&t->t_handshake_mtx, IPL_NET);
+	t->t_max_handshake_retries = MAX_TIMER_HANDSHAKES;
 
 	timeout_set(&t->t_new_handshake, awg_timers_run_new_handshake, t);
 	timeout_set(&t->t_send_keepalive, awg_timers_run_send_keepalive, t);
@@ -1015,20 +1381,24 @@ awg_timers_disable(struct awg_timers *t)
 }
 
 void
-awg_timers_set_persistent_keepalive(struct awg_timers *t, uint16_t interval)
+awg_timers_set_persistent_keepalive(struct awg_timers *t, uint16_t interval,
+    uint16_t interval_hi)
 {
 	mtx_enter(&t->t_mtx);
 	if (!t->t_disabled) {
 		t->t_persistent_keepalive_interval = interval;
+		t->t_persistent_keepalive_hi = MAX(interval, interval_hi);
 		awg_timers_run_persistent_keepalive(t);
 	}
 	mtx_leave(&t->t_mtx);
 }
 
 int
-awg_timers_get_persistent_keepalive(struct awg_timers *t, uint16_t *interval)
+awg_timers_get_persistent_keepalive(struct awg_timers *t, uint16_t *interval,
+    uint16_t *interval_hi)
 {
 	*interval = t->t_persistent_keepalive_interval;
+	*interval_hi = t->t_persistent_keepalive_hi;
 	return *interval > 0 ? 0 : ENOENT;
 }
 
@@ -1043,8 +1413,10 @@ awg_timers_get_last_handshake(struct awg_timers *t, struct timespec *time)
 int
 awg_timers_expired_handshake_last_sent(struct awg_timers *t)
 {
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
 	struct timespec uptime;
-	struct timespec expire = { .tv_sec = REKEY_TIMEOUT, .tv_nsec = 0 };
+	struct timespec expire = {
+		.tv_sec = awg_rekey_min_timeout(peer->p_sc), .tv_nsec = 0 };
 
 	getnanouptime(&uptime);
 	timespecadd(&t->t_handshake_last_sent, &expire, &expire);
@@ -1065,7 +1437,8 @@ awg_timers_check_handshake_last_sent(struct awg_timers *t)
 void
 awg_timers_event_data_sent(struct awg_timers *t)
 {
-	int	msecs = NEW_HANDSHAKE_TIMEOUT * 1000;
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
+	int	msecs = awg_new_handshake_timeout(peer->p_sc) * 1000;
 	msecs += arc4random_uniform(REKEY_TIMEOUT_JITTER);
 
 	mtx_enter(&t->t_mtx);
@@ -1077,11 +1450,13 @@ awg_timers_event_data_sent(struct awg_timers *t)
 void
 awg_timers_event_data_received(struct awg_timers *t)
 {
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
+
 	mtx_enter(&t->t_mtx);
 	if (!t->t_disabled) {
 		if (!timeout_pending(&t->t_send_keepalive))
 			timeout_add_sec(&t->t_send_keepalive,
-			    KEEPALIVE_TIMEOUT);
+			    awg_keepalive_timeout(peer->p_sc));
 		else
 			t->t_need_another_keepalive = 1;
 	}
@@ -1103,17 +1478,23 @@ awg_timers_event_any_authenticated_packet_received(struct awg_timers *t)
 void
 awg_timers_event_any_authenticated_packet_traversal(struct awg_timers *t)
 {
+	struct awg_range pka;
+
 	mtx_enter(&t->t_mtx);
-	if (!t->t_disabled && t->t_persistent_keepalive_interval > 0)
+	if (!t->t_disabled && t->t_persistent_keepalive_interval > 0) {
+		pka.r_lo = t->t_persistent_keepalive_interval;
+		pka.r_hi = t->t_persistent_keepalive_hi;
 		timeout_add_sec(&t->t_persistent_keepalive,
-		    t->t_persistent_keepalive_interval);
+		    awg_range_pick(pka));
+	}
 	mtx_leave(&t->t_mtx);
 }
 
 void
 awg_timers_event_handshake_initiated(struct awg_timers *t)
 {
-	int	msecs = REKEY_TIMEOUT * 1000;
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
+	int	msecs = awg_rekey_timeout(peer->p_sc) * 1000;
 	msecs += arc4random_uniform(REKEY_TIMEOUT_JITTER);
 
 	mtx_enter(&t->t_mtx);
@@ -1133,11 +1514,15 @@ awg_timers_event_handshake_responded(struct awg_timers *t)
 void
 awg_timers_event_handshake_complete(struct awg_timers *t)
 {
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
+
 	mtx_enter(&t->t_mtx);
 	if (!t->t_disabled) {
 		mtx_enter(&t->t_handshake_mtx);
 		timeout_del(&t->t_retry_handshake);
 		t->t_handshake_retries = 0;
+		t->t_max_handshake_retries =
+		    awg_max_handshake_attempts(peer->p_sc);
 		getnanotime(&t->t_handshake_complete);
 		mtx_leave(&t->t_handshake_mtx);
 		awg_timers_run_send_keepalive(t);
@@ -1148,9 +1533,12 @@ awg_timers_event_handshake_complete(struct awg_timers *t)
 void
 awg_timers_event_session_derived(struct awg_timers *t)
 {
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
+
 	mtx_enter(&t->t_mtx);
 	if (!t->t_disabled)
-		timeout_add_sec(&t->t_zero_key_material, REJECT_AFTER_TIME * 3);
+		timeout_add_sec(&t->t_zero_key_material,
+		    awg_keychain_expire_time(peer->p_sc) * 3);
 	mtx_leave(&t->t_mtx);
 }
 
@@ -1166,8 +1554,11 @@ awg_timers_event_want_initiation(struct awg_timers *t)
 void
 awg_timers_event_reset_handshake_last_sent(struct awg_timers *t)
 {
+	struct awg_peer	*peer = CONTAINER_OF(t, struct awg_peer, p_timers);
+
 	mtx_enter(&t->t_handshake_mtx);
-	t->t_handshake_last_sent.tv_sec -= (REKEY_TIMEOUT + 1);
+	t->t_handshake_last_sent.tv_sec -=
+	    (awg_rekey_min_timeout(peer->p_sc) + 1);
 	mtx_leave(&t->t_handshake_mtx);
 }
 
@@ -1176,8 +1567,11 @@ awg_timers_run_send_initiation(void *_t, int is_retry)
 {
 	struct awg_timers *t = _t;
 	struct awg_peer	 *peer = CONTAINER_OF(t, struct awg_peer, p_timers);
-	if (!is_retry)
+	if (!is_retry) {
 		t->t_handshake_retries = 0;
+		t->t_max_handshake_retries =
+		    awg_max_handshake_attempts(peer->p_sc);
+	}
 	if (awg_timers_expired_handshake_last_sent(t) == ETIMEDOUT)
 		task_add(awg_handshake_taskq, &peer->p_send_initiation);
 }
@@ -1190,7 +1584,7 @@ awg_timers_run_retry_handshake(void *_t)
 	char		  ipaddr[INET6_ADDRSTRLEN];
 
 	mtx_enter(&t->t_handshake_mtx);
-	if (t->t_handshake_retries <= MAX_TIMER_HANDSHAKES) {
+	if (t->t_handshake_retries <= t->t_max_handshake_retries) {
 		t->t_handshake_retries++;
 		mtx_leave(&t->t_handshake_mtx);
 
@@ -1199,7 +1593,8 @@ awg_timers_run_retry_handshake(void *_t)
 		    "seconds, retrying (try %d)\n", peer->p_id,
 		    sockaddr_ntop(&peer->p_endpoint.e_remote.r_sa, ipaddr,
 		        sizeof(ipaddr)),
-		    REKEY_TIMEOUT, t->t_handshake_retries + 1);
+		    awg_rekey_min_timeout(peer->p_sc),
+		    t->t_handshake_retries + 1);
 		awg_peer_clear_src(peer);
 		awg_timers_run_send_initiation(t, 1);
 	} else {
@@ -1209,13 +1604,13 @@ awg_timers_run_retry_handshake(void *_t)
 		    "Handshake for peer %llu (%s) did not complete after %d "
 		    "retries, giving up\n", peer->p_id,
 		    sockaddr_ntop(&peer->p_endpoint.e_remote.r_sa, ipaddr,
-		        sizeof(ipaddr)), MAX_TIMER_HANDSHAKES + 2);
+		        sizeof(ipaddr)), t->t_max_handshake_retries + 2);
 
 		timeout_del(&t->t_send_keepalive);
 		mq_purge(&peer->p_stage_queue);
 		if (!timeout_pending(&t->t_zero_key_material))
 			timeout_add_sec(&t->t_zero_key_material,
-			    REJECT_AFTER_TIME * 3);
+			    awg_keychain_expire_time(peer->p_sc) * 3);
 	}
 }
 
@@ -1228,7 +1623,8 @@ awg_timers_run_send_keepalive(void *_t)
 	task_add(awg_crypt_taskq, &peer->p_send_keepalive);
 	if (t->t_need_another_keepalive) {
 		t->t_need_another_keepalive = 0;
-		timeout_add_sec(&t->t_send_keepalive, KEEPALIVE_TIMEOUT);
+		timeout_add_sec(&t->t_send_keepalive,
+		    awg_keepalive_timeout(peer->p_sc));
 	}
 }
 
@@ -1243,7 +1639,7 @@ awg_timers_run_new_handshake(void *_t)
 	    "Retrying handshake with peer %llu (%s) because we "
 	    "stopped hearing back after %d seconds\n", peer->p_id,
 	    sockaddr_ntop(&peer->p_endpoint.e_remote.r_sa, ipaddr,
-	        sizeof(ipaddr)), NEW_HANDSHAKE_TIMEOUT);
+	        sizeof(ipaddr)), awg_new_handshake_timeout(peer->p_sc));
 	awg_peer_clear_src(peer);
 
 	awg_timers_run_send_initiation(t, 0);
@@ -1285,6 +1681,41 @@ awg_peer_send_buf(struct awg_peer *peer, uint8_t *buf, size_t len)
 	awg_send_buf(peer->p_sc, &endpoint, buf, len);
 }
 
+/*
+ * Send a handshake message: S1-S3 random prefix, the message (encrypted with
+ * the header protection key, if any) and an optional random trailer.
+ * peer == NULL (cookie replies) uses the default UDP window.
+ */
+void
+awg_send_hs(struct awg_softc *sc, struct awg_peer *peer,
+    struct awg_endpoint *e, void *msg, size_t len, uint16_t padding)
+{
+	chacha_ctx	 ctx;
+	uint8_t		*buf;
+	size_t		 trailer, total;
+
+	trailer = awg_random_trailer(sc, peer != NULL ?
+	    peer->p_udp_window : AWG_DEFAULT_UDP_WINDOW, padding + len);
+	total = padding + len + trailer;
+	if ((buf = malloc(total, M_TEMP, M_NOWAIT)) == NULL)
+		return;
+
+	arc4random_buf(buf, padding);
+	memcpy(buf + padding, msg, len);
+	arc4random_buf(buf + padding + len, trailer);
+
+	if (padding >= AWG_HPK_NONCE_LEN && awg_hp_init(sc, &ctx, buf)) {
+		chacha_encrypt_bytes(&ctx, buf + padding, buf + padding, len);
+		explicit_bzero(&ctx, sizeof(ctx));
+	}
+
+	if (peer != NULL)
+		awg_peer_send_buf(peer, buf, total);
+	else
+		awg_send_buf(sc, e, buf, total);
+	free(buf, M_TEMP, total);
+}
+
 void
 awg_send_junk(struct awg_softc *sc, struct awg_peer *peer)
 {
@@ -1310,14 +1741,74 @@ awg_send_junk(struct awg_softc *sc, struct awg_peer *peer)
 	}
 }
 
+/* I1-I5 signature packets, sent in order before the junk packets */
+void
+awg_send_ispecs(struct awg_softc *sc, struct awg_peer *peer)
+{
+	struct awg_endpoint	 endpoint;
+	struct awg_ispec	*is;
+	struct awg_ispec_mod	*mod;
+	struct timespec		 now;
+	uint32_t		 counter, val;
+	uint8_t			*buf, *p;
+	size_t			 i, j, len;
+
+	if (sc->sc_awg_version != AWG_VERSION_3_1)
+		return;
+
+	awg_peer_get_endpoint(peer, &endpoint);
+	counter = arc4random();
+
+	rw_enter_read(&sc->sc_ispec_lock);
+	for (i = 0; i < AWG_ISPEC_COUNT; i++) {
+		is = &sc->sc_awg_ispec[i];
+		if (is->is_pkt_len == 0)
+			continue;
+		if ((buf = malloc(is->is_pkt_len, M_TEMP, M_NOWAIT)) == NULL)
+			break;
+		memcpy(buf, is->is_pkt, is->is_pkt_len);
+		for (j = 0; j < is->is_mods_count; j++) {
+			mod = &is->is_mods[j];
+			p = buf + mod->im_off;
+			switch (mod->im_type) {
+			case AWG_ISPEC_MOD_COUNTER:
+				val = htobe32(counter);
+				memcpy(p, &val, sizeof(val));
+				break;
+			case AWG_ISPEC_MOD_TIME:
+				getnanotime(&now);
+				val = htobe32((uint32_t)now.tv_sec);
+				memcpy(p, &val, sizeof(val));
+				break;
+			case AWG_ISPEC_MOD_RAND:
+				arc4random_buf(p, mod->im_len);
+				break;
+			case AWG_ISPEC_MOD_CHARS:
+				for (len = 0; len < mod->im_len; len++) {
+					val = arc4random_uniform(52);
+					p[len] = val < 26 ? 'a' + val :
+					    'A' + val - 26;
+				}
+				break;
+			case AWG_ISPEC_MOD_DIGITS:
+				for (len = 0; len < mod->im_len; len++)
+					p[len] = '0' + arc4random_uniform(10);
+				break;
+			}
+		}
+		awg_send_buf(sc, &endpoint, buf, is->is_pkt_len);
+		free(buf, M_TEMP, is->is_pkt_len);
+		counter++;
+	}
+	rw_exit_read(&sc->sc_ispec_lock);
+}
+
 void
 awg_send_initiation(void *_peer)
 {
 	struct awg_peer			*peer = _peer;
 	struct awg_softc		*sc = peer->p_sc;
 	struct awg_pkt_initiation	 pkt;
-	uint8_t				*buf;
-	size_t				 total;
 	char				 ipaddr[INET6_ADDRSTRLEN];
 
 	if (awg_timers_check_handshake_last_sent(&peer->p_timers) != ETIMEDOUT)
@@ -1328,27 +1819,19 @@ awg_send_initiation(void *_peer)
 	    sockaddr_ntop(&peer->p_endpoint.e_remote.r_sa, ipaddr,
 	        sizeof(ipaddr)));
 
-	if (noise_create_initiation(&peer->p_remote, &pkt.s_idx, pkt.ue, pkt.es,
+	if (awg_noise_create_initiation(&peer->p_remote, &pkt.s_idx, pkt.ue, pkt.es,
 				    pkt.ets) != 0)
 		return;
-	pkt.t = htole32(sc->sc_awg_h1);
+	pkt.t = htole32(awg_range_pick(sc->sc_awg_h1));
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	    sizeof(pkt)-sizeof(pkt.m));
+
+	awg_send_ispecs(sc, peer);
 
 	if (sc->sc_awg_jc > 0)
 		awg_send_junk(sc, peer);
 
-	if (sc->sc_awg_s1 > 0) {
-		total = sc->sc_awg_s1 + sizeof(pkt);
-		if ((buf = malloc(total, M_TEMP, M_NOWAIT)) == NULL)
-			return;
-		arc4random_buf(buf, sc->sc_awg_s1);
-		memcpy(buf + sc->sc_awg_s1, &pkt, sizeof(pkt));
-		awg_peer_send_buf(peer, buf, total);
-		free(buf, M_TEMP, total);
-	} else {
-		awg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
-	}
+	awg_send_hs(sc, peer, NULL, &pkt, sizeof(pkt), sc->sc_awg_s1);
 	awg_timers_event_handshake_initiated(&peer->p_timers);
 }
 
@@ -1364,28 +1847,17 @@ awg_send_response(struct awg_peer *peer)
 	    sockaddr_ntop(&peer->p_endpoint.e_remote.r_sa, ipaddr,
 	        sizeof(ipaddr)));
 
-	if (noise_create_response(&peer->p_remote, &pkt.s_idx, &pkt.r_idx,
+	if (awg_noise_create_response(&peer->p_remote, &pkt.s_idx, &pkt.r_idx,
 				  pkt.ue, pkt.en) != 0)
 		return;
-	if (noise_remote_begin_session(&peer->p_remote) != 0)
+	if (awg_noise_remote_begin_session(&peer->p_remote) != 0)
 		return;
 	awg_timers_event_session_derived(&peer->p_timers);
-	pkt.t = htole32(sc->sc_awg_h2);
+	pkt.t = htole32(awg_range_pick(sc->sc_awg_h2));
 	cookie_maker_mac(&peer->p_cookie, &pkt.m, &pkt,
 	    sizeof(pkt)-sizeof(pkt.m));
 	awg_timers_event_handshake_responded(&peer->p_timers);
-	if (sc->sc_awg_s2 > 0) {
-		size_t total = sc->sc_awg_s2 + sizeof(pkt);
-		uint8_t *buf = malloc(total, M_TEMP, M_NOWAIT);
-		if (buf == NULL)
-			return;
-		arc4random_buf(buf, sc->sc_awg_s2);
-		memcpy(buf + sc->sc_awg_s2, &pkt, sizeof(pkt));
-		awg_peer_send_buf(peer, buf, total);
-		free(buf, M_TEMP, total);
-	} else {
-		awg_peer_send_buf(peer, (uint8_t *)&pkt, sizeof(pkt));
-	}
+	awg_send_hs(sc, peer, NULL, &pkt, sizeof(pkt), sc->sc_awg_s2);
 }
 
 void
@@ -1397,13 +1869,13 @@ awg_send_cookie(struct awg_softc *sc, struct cookie_macs *cm, uint32_t idx,
 	AWGPRINTF(LOG_DEBUG, sc, NULL, "Sending cookie response for denied "
 	    "handshake message\n");
 
-	pkt.t = htole32(sc->sc_awg_h3);
+	pkt.t = htole32(awg_range_pick(sc->sc_awg_h3));
 	pkt.r_idx = idx;
 
 	cookie_checker_create_payload(&sc->sc_cookie, cm, pkt.nonce,
 	    pkt.ec, &e->e_remote.r_sa);
 
-	awg_send_buf(sc, e, (uint8_t *)&pkt, sizeof(pkt));
+	awg_send_hs(sc, NULL, e, &pkt, sizeof(pkt), sc->sc_awg_s3);
 }
 
 void
@@ -1432,7 +1904,7 @@ awg_send_keepalive(void *_peer)
 
 	mq_push(&peer->p_stage_queue, m);
 send:
-	if (noise_remote_ready(&peer->p_remote) == 0) {
+	if (awg_noise_remote_ready(&peer->p_remote) == 0) {
 		awg_queue_out(sc, peer);
 		task_add(awg_crypt_taskq, &sc->sc_encap);
 	} else {
@@ -1444,7 +1916,7 @@ void
 awg_peer_clear_secrets(void *_peer)
 {
 	struct awg_peer *peer = _peer;
-	noise_remote_clear(&peer->p_remote);
+	awg_noise_remote_clear(&peer->p_remote);
 }
 
 void
@@ -1455,12 +1927,15 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 	struct awg_pkt_response		*resp;
 	struct awg_pkt_cookie		*cook;
 	struct awg_peer			*peer;
-	struct noise_remote		*remote;
+	struct awg_noise_remote		*remote;
 	int				 res, underload = 0;
 	static struct timeval		 awg_last_underload; /* microuptime */
 	char				 ipaddr[INET6_ADDRSTRLEN];
 
-	if (mq_len(&sc->sc_handshake_queue) >= MAX_QUEUED_HANDSHAKES/8) {
+	if (sc->sc_awg_disable_cookies) {
+		/* DisableCookies: never ask for a cookie, never ratelimit */
+		underload = 0;
+	} else if (mq_len(&sc->sc_handshake_queue) >= MAX_QUEUED_HANDSHAKES/8) {
 		getmicrouptime(&awg_last_underload);
 		underload = 1;
 	} else if (awg_last_underload.tv_sec != 0) {
@@ -1472,9 +1947,8 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 
 	t = awg_tag_get(m);
 
-	{
-	uint32_t __pkt_t = *mtod(m, uint32_t *);
-	if (__pkt_t == htole32(sc->sc_awg_h1)) {
+	switch (t->t_type) {
+	case AWG_TYPE_INITIATION:
 		init = mtod(m, struct awg_pkt_initiation *);
 
 		res = cookie_checker_validate_macs(&sc->sc_cookie, &init->m,
@@ -1501,7 +1975,7 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 			panic("unexpected response: %d", res);
 		}
 
-		if (noise_consume_initiation(&sc->sc_local, &remote,
+		if (awg_noise_consume_initiation(&sc->sc_local, &remote,
 		    init->s_idx, init->ue, init->es, init->ets) != 0) {
 			AWGPRINTF(LOG_INFO, sc, NULL, "Invalid handshake "
 			    "initiation from %s\n",
@@ -1520,7 +1994,8 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 		awg_peer_counters_add(peer, 0, sizeof(*init));
 		awg_peer_set_endpoint_from_tag(peer, t);
 		awg_send_response(peer);
-	} else if (__pkt_t == htole32(sc->sc_awg_h2)) {
+		break;
+	case AWG_TYPE_RESPONSE:
 		resp = mtod(m, struct awg_pkt_response *);
 
 		res = cookie_checker_validate_macs(&sc->sc_cookie, &resp->m,
@@ -1557,7 +2032,7 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 
 		peer = CONTAINER_OF(remote, struct awg_peer, p_remote);
 
-		if (noise_consume_response(remote, resp->s_idx, resp->r_idx,
+		if (awg_noise_consume_response(remote, resp->s_idx, resp->r_idx,
 					   resp->ue, resp->en) != 0) {
 			AWGPRINTF(LOG_INFO, sc, NULL, "Invalid handshake "
 			    "response from %s\n",
@@ -1573,11 +2048,12 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 
 		awg_peer_counters_add(peer, 0, sizeof(*resp));
 		awg_peer_set_endpoint_from_tag(peer, t);
-		if (noise_remote_begin_session(&peer->p_remote) == 0) {
+		if (awg_noise_remote_begin_session(&peer->p_remote) == 0) {
 			awg_timers_event_session_derived(&peer->p_timers);
 			awg_timers_event_handshake_complete(&peer->p_timers);
 		}
-	} else if (__pkt_t == htole32(sc->sc_awg_h3)) {
+		break;
+	case AWG_TYPE_COOKIE:
 		cook = mtod(m, struct awg_pkt_cookie *);
 
 		if ((remote = awg_index_get(sc, cook->r_idx)) == NULL) {
@@ -1604,9 +2080,8 @@ awg_handshake(struct awg_softc *sc, struct mbuf *m)
 		    sockaddr_ntop(&t->t_endpoint.e_remote.r_sa, ipaddr,
 		        sizeof(ipaddr)));
 		goto error;
-	} else {
+	default:
 		panic("invalid packet in handshake queue");
-	}
 	}
 
 	awg_timers_event_any_authenticated_packet_received(&peer->p_timers);
@@ -1655,16 +2130,32 @@ awg_encap(struct awg_softc *sc, struct mbuf *m)
 	struct awg_peer		*peer;
 	struct awg_tag		*t;
 	struct mbuf		*mc;
-	size_t			 padding_len, plaintext_len, out_len;
+	chacha_ctx		 ctx;
+	uint8_t			*prefix;
+	size_t			 padding_len, plaintext_len, out_len, size;
 	uint64_t		 nonce;
+	uint16_t		 s4 = sc->sc_awg_s4;
 	char			 ipaddr[INET6_ADDRSTRLEN];
 
 	t = awg_tag_get(m);
 	peer = t->t_peer;
 
-	plaintext_len = AWG_PKT_WITH_PADDING(m->m_pkthdr.len);
-	padding_len = plaintext_len - m->m_pkthdr.len;
-	out_len = sizeof(struct awg_pkt_data) + plaintext_len +
+	/*
+	 * Transport padding inside the encrypted payload: ContentPaddingAddition
+	 * or RandomTrailers (3.1, bounded by the peer's UDP window), otherwise
+	 * the WireGuard multiple of 16.
+	 */
+	size = s4 + AWG_MIN_DATA_SIZE + m->m_pkthdr.len;
+	awg_peer_update_udp_window(peer, size);
+	if (!awg_range_is_zero(sc->sc_awg_cpa))
+		padding_len = awg_content_padding(sc, peer->p_udp_window, size);
+	else if (sc->sc_awg_random_trailers)
+		padding_len = awg_random_trailer(sc, peer->p_udp_window, size);
+	else
+		padding_len = AWG_PKT_WITH_PADDING(m->m_pkthdr.len) -
+		    m->m_pkthdr.len;
+	plaintext_len = m->m_pkthdr.len + padding_len;
+	out_len = s4 + sizeof(struct awg_pkt_data) + plaintext_len +
 	    NOISE_AUTHTAG_LEN;
 
 	/*
@@ -1673,18 +2164,21 @@ awg_encap(struct awg_softc *sc, struct mbuf *m)
 	 * overcome as p_encap_queue (mbuf_list) holds a reference to the mbuf.
 	 * If we m_makespace or similar, we risk corrupting that list.
 	 * Additionally, we only pass a buf and buf length to
-	 * noise_remote_encrypt. Technically it would be possible to teach
-	 * noise_remote_encrypt about mbufs, but we would need to sort out the
+	 * awg_noise_remote_encrypt. Technically it would be possible to teach
+	 * awg_noise_remote_encrypt about mbufs, but we would need to sort out the
 	 * p_encap_queue situation first.
 	 */
 	if ((mc = m_clget(NULL, M_NOWAIT, out_len + max_hdr)) == NULL)
 		goto error;
 	m_align(mc, out_len);
 
-	data = mtod(mc, struct awg_pkt_data *);
+	/* S4 random prefix, then the transport message */
+	prefix = mtod(mc, uint8_t *);
+	arc4random_buf(prefix, s4);
+	data = (struct awg_pkt_data *)(prefix + s4);
 	m_copydata(m, 0, m->m_pkthdr.len, data->buf);
 	bzero(data->buf + m->m_pkthdr.len, padding_len);
-	data->t = htole32(sc->sc_awg_h4);
+	data->t = htole32(awg_range_pick(sc->sc_awg_h4));
 
 	/*
 	 * Copy the flow hash from the inner packet to the outer packet, so
@@ -1695,10 +2189,16 @@ awg_encap(struct awg_softc *sc, struct mbuf *m)
 
 	mc->m_pkthdr.pf.prio = m->m_pkthdr.pf.prio;
 
-	res = noise_remote_encrypt(&peer->p_remote, &data->r_idx, &nonce,
+	res = awg_noise_remote_encrypt(&peer->p_remote, &data->r_idx, &nonce,
 				   data->buf, plaintext_len);
 	nonce = htole64(nonce); /* Wire format is little endian. */
 	memcpy(data->nonce, &nonce, sizeof(data->nonce));
+
+	if (s4 >= AWG_HPK_NONCE_LEN && awg_hp_init(sc, &ctx, prefix)) {
+		chacha_encrypt_bytes(&ctx, (uint8_t *)data, (uint8_t *)data,
+		    sizeof(*data));
+		explicit_bzero(&ctx, sizeof(ctx));
+	}
 
 	if (__predict_false(res == EINVAL)) {
 		m_freem(mc);
@@ -1752,7 +2252,7 @@ awg_decap(struct awg_softc *sc, struct mbuf *m)
 
 	/*
 	 * Likewise to awg_encap, we pass a buf and buf length to 
-	 * noise_remote_decrypt. Again, possible to teach it about mbufs
+	 * awg_noise_remote_decrypt. Again, possible to teach it about mbufs
 	 * but need to get over the p_decap_queue situation first. However,
 	 * we do not need to allocate a new mbuf as the decrypted packet is
 	 * strictly smaller than encrypted. We just set t_mbuf to m and
@@ -1762,7 +2262,7 @@ awg_decap(struct awg_softc *sc, struct mbuf *m)
 	payload_len = m->m_pkthdr.len - sizeof(struct awg_pkt_data);
 	memcpy(&nonce, data->nonce, sizeof(nonce));
 	nonce = le64toh(nonce); /* Wire format is little endian. */
-	res = noise_remote_decrypt(&peer->p_remote, data->r_idx, nonce,
+	res = awg_noise_remote_decrypt(&peer->p_remote, data->r_idx, nonce,
 				   data->buf, payload_len);
 
 	if (__predict_false(res == EINVAL)) {
@@ -1781,6 +2281,16 @@ awg_decap(struct awg_softc *sc, struct mbuf *m)
 
 	m_adj(m, sizeof(struct awg_pkt_data));
 	m_adj(m, -NOISE_AUTHTAG_LEN);
+
+	awg_peer_update_udp_window(peer,
+	    sc->sc_awg_s4 + AWG_MIN_DATA_SIZE + m->m_pkthdr.len);
+
+	/*
+	 * With S4, ContentPaddingAddition or RandomTrailers a keepalive
+	 * carries zero padding: no IP version nibble means keepalive.
+	 */
+	if (m->m_pkthdr.len > 0 && *mtod(m, uint8_t *) == 0)
+		m_adj(m, -m->m_pkthdr.len);
 
 	counters_pkt(sc->sc_if.if_counters, ifc_ipackets, ifc_ibytes,
 	    m->m_pkthdr.len);
@@ -2070,7 +2580,7 @@ awg_queue_dequeue(struct awg_queue *q, struct awg_tag **t)
 	return m;
 }
 
-struct noise_remote *
+struct awg_noise_remote *
 awg_remote_get(void *_sc, uint8_t public[NOISE_PUBLIC_KEY_LEN])
 {
 	struct awg_peer	*peer;
@@ -2081,7 +2591,7 @@ awg_remote_get(void *_sc, uint8_t public[NOISE_PUBLIC_KEY_LEN])
 }
 
 uint32_t
-awg_index_set(void *_sc, struct noise_remote *remote)
+awg_index_set(void *_sc, struct awg_noise_remote *remote)
 {
 	struct awg_peer	*peer;
 	struct awg_softc	*sc = _sc;
@@ -2115,12 +2625,12 @@ assign_id:
 	return index->i_key;
 }
 
-struct noise_remote *
+struct awg_noise_remote *
 awg_index_get(void *_sc, uint32_t key0)
 {
 	struct awg_softc		*sc = _sc;
 	struct awg_index		*iter;
-	struct noise_remote	*remote = NULL;
+	struct awg_noise_remote	*remote = NULL;
 	uint32_t		 key = key0 & sc->sc_index_mask;
 
 	mtx_enter(&sc->sc_index_mtx);
@@ -2155,15 +2665,84 @@ awg_index_drop(void *_sc, uint32_t key0)
 	SLIST_INSERT_HEAD(&peer->p_unused_index, iter, i_unused_entry);
 }
 
+/*
+ * Find the message type of an incoming datagram from its size, the S1-S4
+ * prefixes and the H1-H4 ranges (DeterminePacketTypeAndPadding in
+ * amneziawg-go). With header protection the type field is decrypted with
+ * the first 4 key stream bytes; the caller decrypts the rest of the header
+ * (msglen bytes after the prefix) with the same nonce.
+ */
+int
+awg_classify(struct awg_softc *sc, struct mbuf *m, size_t *padding,
+    size_t *msglen, uint8_t nonce[AWG_HPK_NONCE_LEN], int *hp)
+{
+	static const struct {
+		int	type;
+		size_t	size;
+	} hs[] = {
+		{ AWG_TYPE_INITIATION,	sizeof(struct awg_pkt_initiation) },
+		{ AWG_TYPE_RESPONSE,	sizeof(struct awg_pkt_response) },
+		{ AWG_TYPE_COOKIE,	sizeof(struct awg_pkt_cookie) },
+	};
+	struct awg_range	 h[4] = { sc->sc_awg_h1, sc->sc_awg_h2,
+				    sc->sc_awg_h3, sc->sc_awg_h4 };
+	size_t			 s[4] = { sc->sc_awg_s1, sc->sc_awg_s2,
+				    sc->sc_awg_s3, sc->sc_awg_s4 };
+	chacha_ctx		 ctx;
+	uint8_t			*buf = mtod(m, uint8_t *);
+	uint8_t			 hash[4] = { 0 };
+	size_t			 len = m->m_pkthdr.len, i;
+	uint32_t		 typ, mask;
+	int			 trailers = sc->sc_awg_random_trailers;
+
+	*hp = 0;
+	if (sc->sc_awg_has_hpk && len >= AWG_HPK_NONCE_LEN) {
+		memcpy(nonce, buf, AWG_HPK_NONCE_LEN);
+		if ((*hp = awg_hp_init(sc, &ctx, nonce))) {
+			chacha_encrypt_bytes(&ctx, hash, hash, sizeof(hash));
+			explicit_bzero(&ctx, sizeof(ctx));
+		}
+	}
+	memcpy(&mask, hash, sizeof(mask));
+
+	for (i = 0; i < nitems(hs); i++) {
+		if (!(len == s[i] + hs[i].size ||
+		    (trailers && len > s[i] + hs[i].size)))
+			continue;
+		memcpy(&typ, buf + s[i], sizeof(typ));
+		typ ^= mask;
+		if (awg_range_contains(h[i], letoh32(typ))) {
+			*padding = s[i];
+			*msglen = hs[i].size;
+			return hs[i].type;
+		}
+	}
+
+	if (len >= s[3] + AWG_MIN_DATA_SIZE) {
+		memcpy(&typ, buf + s[3], sizeof(typ));
+		typ ^= mask;
+		if (awg_range_contains(h[3], letoh32(typ))) {
+			*padding = s[3];
+			*msglen = sizeof(struct awg_pkt_data);
+			return AWG_TYPE_DATA;
+		}
+	}
+	return 0;
+}
+
 struct mbuf *
 awg_input(void *_sc, struct mbuf *m, struct ip *ip, struct ip6_hdr *ip6,
     void *_uh, int hlen, struct netstack *ns)
 {
 	struct awg_pkt_data	*data;
-	struct noise_remote	*remote;
+	struct awg_noise_remote	*remote;
 	struct awg_tag		*t;
 	struct awg_softc		*sc = _sc;
 	struct udphdr		*uh = _uh;
+	chacha_ctx		 ctx;
+	uint8_t			 nonce[AWG_HPK_NONCE_LEN];
+	size_t			 padding, msglen;
+	int			 type, hp;
 	char			 ipaddr[INET6_ADDRSTRLEN];
 
 	NET_ASSERT_LOCKED();
@@ -2199,54 +2778,37 @@ awg_input(void *_sc, struct mbuf *m, struct ip *ip, struct ip6_hdr *ip6,
 	 * Ensure mbuf is contiguous over full length of packet. This is done
 	 * so we can directly read the handshake values in awg_handshake, and so
 	 * we can decrypt a transport packet by passing a single buffer to
-	 * noise_remote_decrypt in awg_decap.
+	 * awg_noise_remote_decrypt in awg_decap.
 	 */
 	if ((m = m_pullup(m, m->m_pkthdr.len)) == NULL)
 		return NULL;
 
-	{
-		uint32_t *typep;
-		int is_hs = 0;
+	if ((type = awg_classify(sc, m, &padding, &msglen, nonce, &hp)) == 0) {
+		counters_inc(sc->sc_if.if_counters, ifc_ierrors);
+		m_freem(m);
+		return NULL;
+	}
 
-		/* Initiation: sc_awg_s1 junk prefix, then h1 magic type */
-		if (m->m_pkthdr.len ==
-		    sizeof(struct awg_pkt_initiation) + sc->sc_awg_s1) {
-			typep = (uint32_t *)((uint8_t *)mtod(m, void *) +
-			    sc->sc_awg_s1);
-			if (*typep == htole32(sc->sc_awg_h1)) {
-				if (sc->sc_awg_s1 > 0)
-					m_adj(m, sc->sc_awg_s1);
-				is_hs = 1;
-			}
-		}
-		/* Response: sc_awg_s2 junk prefix, then h2 magic type */
-		else if (m->m_pkthdr.len ==
-		    sizeof(struct awg_pkt_response) + sc->sc_awg_s2) {
-			typep = (uint32_t *)((uint8_t *)mtod(m, void *) +
-			    sc->sc_awg_s2);
-			if (*typep == htole32(sc->sc_awg_h2)) {
-				if (sc->sc_awg_s2 > 0)
-					m_adj(m, sc->sc_awg_s2);
-				is_hs = 1;
-			}
-		}
-		/* Cookie reply: no junk prefix, h3 magic type */
-		else if (m->m_pkthdr.len == sizeof(struct awg_pkt_cookie) &&
-		    *mtod(m, uint32_t *) == htole32(sc->sc_awg_h3)) {
-			is_hs = 1;
-		}
+	/* Strip the S1-S4 prefix and, for handshakes, any random trailer */
+	m_adj(m, padding);
+	if (type != AWG_TYPE_DATA && m->m_pkthdr.len > msglen)
+		m_adj(m, -(int)(m->m_pkthdr.len - msglen));
 
-		if (is_hs) {
-			if (mq_enqueue(&sc->sc_handshake_queue, m) != 0)
-				AWGPRINTF(LOG_DEBUG, sc, NULL, "Dropping handshake"
-				    "packet from %s\n",
-				    sockaddr_ntop(&t->t_endpoint.e_remote.r_sa,
-				        ipaddr, sizeof(ipaddr)));
-			task_add(awg_handshake_taskq, &sc->sc_handshake);
-		} else if (m->m_pkthdr.len >= sizeof(struct awg_pkt_data) +
-		    NOISE_AUTHTAG_LEN &&
-		    *mtod(m, uint32_t *) == htole32(sc->sc_awg_h4)) {
+	if (hp && awg_hp_init(sc, &ctx, nonce)) {
+		chacha_encrypt_bytes(&ctx, mtod(m, uint8_t *),
+		    mtod(m, uint8_t *), msglen);
+		explicit_bzero(&ctx, sizeof(ctx));
+	}
 
+	t->t_type = type;
+	if (type != AWG_TYPE_DATA) {
+		if (mq_enqueue(&sc->sc_handshake_queue, m) != 0)
+			AWGPRINTF(LOG_DEBUG, sc, NULL, "Dropping handshake"
+			    "packet from %s\n",
+			    sockaddr_ntop(&t->t_endpoint.e_remote.r_sa,
+			        ipaddr, sizeof(ipaddr)));
+		task_add(awg_handshake_taskq, &sc->sc_handshake);
+	} else {
 		data = mtod(m, struct awg_pkt_data *);
 
 		if ((remote = awg_index_get(sc, data->r_idx)) != NULL) {
@@ -2259,10 +2821,6 @@ awg_input(void *_sc, struct mbuf *m, struct ip *ip, struct ip6_hdr *ip6,
 				counters_inc(sc->sc_if.if_counters,
 				    ifc_iqdrops);
 			task_add(awg_crypt_taskq, &sc->sc_decap);
-		} else {
-			counters_inc(sc->sc_if.if_counters, ifc_ierrors);
-			m_freem(m);
-		}
 		} else {
 			counters_inc(sc->sc_if.if_counters, ifc_ierrors);
 			m_freem(m);
@@ -2300,7 +2858,7 @@ awg_qstart(struct ifqueue *ifq)
 		}
 	}
 	SLIST_FOREACH(peer, &start_list, p_start_list) {
-		if (noise_remote_ready(&peer->p_remote) == 0)
+		if (awg_noise_remote_ready(&peer->p_remote) == 0)
 			awg_queue_out(sc, peer);
 		else
 			awg_timers_event_want_initiation(&peer->p_timers);
@@ -2394,6 +2952,118 @@ error:
 	return ret;
 }
 
+/*
+ * Validate the AmneziaWG parameters of a SIOCSAWG request against the
+ * resulting interface state, before anything is changed.
+ */
+int
+awg_ioctl_check(struct awg_softc *sc, struct awg_interface_io *io)
+{
+	struct awg_range	 h[4], *timing[5];
+	uint16_t		 s[4];
+	uint32_t		 f = io->i_flags;
+	int			 i, j, version, legacy, has_hpk;
+
+	version = f & AWG_INTERFACE_HAS_VERSION ?
+	    io->i_version : sc->sc_awg_version;
+	if (version != AWG_VERSION_LEGACY && version != AWG_VERSION_3_1)
+		return EINVAL;
+	legacy = version == AWG_VERSION_LEGACY;
+
+	if (legacy && (f & AWG_INTERFACE_HAS_3_1))
+		return EINVAL;
+
+	if (f & AWG_INTERFACE_HAS_H) {
+		h[0] = io->i_h1; h[1] = io->i_h2;
+		h[2] = io->i_h3; h[3] = io->i_h4;
+		for (i = 0; i < 4; i++)
+			if (h[i].r_lo > h[i].r_hi ||
+			    (legacy && h[i].r_lo != h[i].r_hi))
+				return EINVAL;
+	} else {
+		h[0] = sc->sc_awg_h1; h[1] = sc->sc_awg_h2;
+		h[2] = sc->sc_awg_h3; h[3] = sc->sc_awg_h4;
+	}
+	/* Ranges must not overlap or packets can't be told apart */
+	if (!legacy)
+		for (i = 0; i < 4; i++)
+			for (j = i + 1; j < 4; j++)
+				if (awg_range_overlap(h[i], h[j]))
+					return EINVAL;
+
+	timing[0] = &io->i_rekey_after_time;
+	timing[1] = &io->i_rekey_timeout;
+	timing[2] = &io->i_reject_after_time;
+	timing[3] = &io->i_keepalive_timeout;
+	timing[4] = &io->i_max_handshake_attempts;
+	for (i = 0; i < 5; i++)
+		if (f & (AWG_INTERFACE_HAS_REKEY_AFTER_TIME << i) &&
+		    (timing[i]->r_lo > timing[i]->r_hi ||
+		    timing[i]->r_hi > UINT16_MAX))
+			return EINVAL;
+	if (f & AWG_INTERFACE_HAS_CPA &&
+	    (io->i_cpa.r_lo > io->i_cpa.r_hi || io->i_cpa.r_hi > UINT16_MAX))
+		return EINVAL;
+
+	/* HeaderProtectionKey takes its nonce from S1-S4 */
+	s[0] = f & AWG_INTERFACE_HAS_S12 ? io->i_s1 : sc->sc_awg_s1;
+	s[1] = f & AWG_INTERFACE_HAS_S12 ? io->i_s2 : sc->sc_awg_s2;
+	s[2] = f & AWG_INTERFACE_HAS_S3 ? io->i_s3 : sc->sc_awg_s3;
+	s[3] = f & AWG_INTERFACE_HAS_S4 ? io->i_s4 : sc->sc_awg_s4;
+	if (f & AWG_INTERFACE_HAS_HPK) {
+		for (has_hpk = 0, i = 0; i < AWG_HPK_LEN; i++)
+			has_hpk |= io->i_hpk[i];
+	} else {
+		has_hpk = !legacy && sc->sc_awg_has_hpk;
+	}
+	if (has_hpk)
+		for (i = 0; i < 4; i++)
+			if (s[i] < AWG_HPK_NONCE_LEN)
+				return EINVAL;
+
+	return 0;
+}
+
+/* Drop everything AmneziaWG 3.1 when switching to the legacy protocol */
+void
+awg_reset_3_1(struct awg_softc *sc, struct awg_ispec old[AWG_ISPEC_COUNT])
+{
+	struct awg_peer	*peer;
+	int		 i;
+
+	sc->sc_awg_s3 = sc->sc_awg_s4 = 0;
+	sc->sc_awg_h1.r_hi = sc->sc_awg_h1.r_lo;
+	sc->sc_awg_h2.r_hi = sc->sc_awg_h2.r_lo;
+	sc->sc_awg_h3.r_hi = sc->sc_awg_h3.r_lo;
+	sc->sc_awg_h4.r_hi = sc->sc_awg_h4.r_lo;
+	sc->sc_awg_has_hpk = 0;
+	explicit_bzero(sc->sc_awg_hpk, sizeof(sc->sc_awg_hpk));
+	bzero(&sc->sc_awg_cpa, sizeof(sc->sc_awg_cpa));
+	bzero(&sc->sc_awg_rekey_after_time, sizeof(struct awg_range));
+	bzero(&sc->sc_awg_rekey_timeout, sizeof(struct awg_range));
+	bzero(&sc->sc_awg_reject_after_time, sizeof(struct awg_range));
+	bzero(&sc->sc_awg_keepalive_timeout, sizeof(struct awg_range));
+	bzero(&sc->sc_awg_max_handshake_attempts, sizeof(struct awg_range));
+	sc->sc_awg_random_trailers = 0;
+	sc->sc_awg_disable_cookies = 0;
+	awg_update_noise_timings(sc);
+
+	rw_enter_write(&sc->sc_ispec_lock);
+	for (i = 0; i < AWG_ISPEC_COUNT; i++) {
+		awg_ispec_free(&old[i]);
+		old[i] = sc->sc_awg_ispec[i];
+		bzero(&sc->sc_awg_ispec[i], sizeof(sc->sc_awg_ispec[i]));
+	}
+	rw_exit_write(&sc->sc_ispec_lock);
+
+	TAILQ_FOREACH(peer, &sc->sc_peer_seq, p_seq_entry) {
+		mtx_enter(&peer->p_timers.t_mtx);
+		peer->p_timers.t_persistent_keepalive_hi =
+		    peer->p_timers.t_persistent_keepalive_interval;
+		mtx_leave(&peer->p_timers.t_mtx);
+	}
+}
+
 int
 awg_ioctl_set(struct awg_softc *sc, struct awg_data_io *data)
 {
@@ -2408,40 +3078,61 @@ awg_ioctl_set(struct awg_softc *sc, struct awg_data_io *data)
 	int			 rtable;
 
 	uint8_t			 public[AWG_KEY_SIZE], private[AWG_KEY_SIZE];
+	struct awg_ispec	 ispec[AWG_ISPEC_COUNT];
+	char			*ispec_buf = NULL;
 	size_t			 i, j;
-	int			 ret, has_identity;
+	int			 ret, has_identity, legacy;
 
 	if ((ret = suser(curproc)) != 0)
 		return ret;
 
+	bzero(ispec, sizeof(ispec));
 	rw_enter_write(&sc->sc_lock);
 
 	iface_p = data->awgd_interface;
 	if ((ret = copyin(iface_p, &iface_o, sizeof(iface_o))) != 0)
 		goto error;
 
+	if ((ret = awg_ioctl_check(sc, &iface_o)) != 0)
+		goto error;
+	legacy = (iface_o.i_flags & AWG_INTERFACE_HAS_VERSION ?
+	    iface_o.i_version : sc->sc_awg_version) == AWG_VERSION_LEGACY;
+
+	/* I1-I5 are parsed up front, they are swapped in at the end */
+	for (i = 0; i < AWG_ISPEC_COUNT; i++) {
+		if (!(iface_o.i_flags & AWG_INTERFACE_HAS_I(i)))
+			continue;
+		if (ispec_buf == NULL)
+			ispec_buf = malloc(AWG_ISPEC_MAXLEN, M_TEMP, M_WAITOK);
+		if ((ret = copyinstr(iface_o.i_ispec[i], ispec_buf,
+		    AWG_ISPEC_MAXLEN, NULL)) != 0)
+			goto error;
+		if ((ret = awg_ispec_parse(&ispec[i], ispec_buf)) != 0)
+			goto error;
+	}
+
 	if (iface_o.i_flags & AWG_INTERFACE_REPLACE_PEERS)
 		TAILQ_FOREACH_SAFE(peer, &sc->sc_peer_seq, p_seq_entry, tpeer)
 			awg_peer_destroy(peer);
 
 	if (iface_o.i_flags & AWG_INTERFACE_HAS_PRIVATE &&
-	    (noise_local_keys(&sc->sc_local, NULL, private) ||
+	    (awg_noise_local_keys(&sc->sc_local, NULL, private) ||
 	     timingsafe_bcmp(private, iface_o.i_private, AWG_KEY_SIZE))) {
 		if (curve25519_generate_public(public, iface_o.i_private)) {
 			if ((peer = awg_peer_lookup(sc, public)) != NULL)
 				awg_peer_destroy(peer);
 		}
-		noise_local_lock_identity(&sc->sc_local);
-		has_identity = noise_local_set_private(&sc->sc_local,
+		awg_noise_local_lock_identity(&sc->sc_local);
+		has_identity = awg_noise_local_set_private(&sc->sc_local,
 						       iface_o.i_private);
 		TAILQ_FOREACH(peer, &sc->sc_peer_seq, p_seq_entry) {
-			noise_remote_precompute(&peer->p_remote);
+			awg_noise_remote_precompute(&peer->p_remote);
 			awg_timers_event_reset_handshake_last_sent(&peer->p_timers);
-			noise_remote_expire_current(&peer->p_remote);
+			awg_noise_remote_expire_current(&peer->p_remote);
 		}
 		cookie_checker_update(&sc->sc_cookie,
 				      has_identity == 0 ? public : NULL);
-		noise_local_unlock_identity(&sc->sc_local);
+		awg_noise_local_unlock_identity(&sc->sc_local);
 	}
 
 	if (iface_o.i_flags & AWG_INTERFACE_HAS_PORT)
@@ -2475,6 +3166,14 @@ awg_ioctl_set(struct awg_softc *sc, struct awg_data_io *data)
 		if (!(peer_o.p_flags & AWG_PEER_HAS_PUBLIC))
 			goto next_peer;
 
+		/* PersistentKeepalive ranges are AmneziaWG 3.1 */
+		if (peer_o.p_flags & AWG_PEER_HAS_PKA &&
+		    peer_o.p_pka_hi != 0 && (peer_o.p_pka_hi < peer_o.p_pka ||
+		    (legacy && peer_o.p_pka_hi != peer_o.p_pka))) {
+			ret = EINVAL;
+			goto error;
+		}
+
 		/* 0 = latest protocol, 1 = this protocol */
 		if (peer_o.p_protocol_version != 0) {
 			if (peer_o.p_protocol_version > 1) {
@@ -2484,7 +3183,7 @@ awg_ioctl_set(struct awg_softc *sc, struct awg_data_io *data)
 		}
 
 		/* Get local public and check that peer key doesn't match */
-		if (noise_local_keys(&sc->sc_local, public, NULL) == 0 &&
+		if (awg_noise_local_keys(&sc->sc_local, public, NULL) == 0 &&
 		    bcmp(public, peer_o.p_public, AWG_KEY_SIZE) == 0)
 			goto next_peer;
 
@@ -2513,11 +3212,11 @@ awg_ioctl_set(struct awg_softc *sc, struct awg_data_io *data)
 			awg_peer_set_sockaddr(peer, &peer_o.p_sa);
 
 		if (peer_o.p_flags & AWG_PEER_HAS_PSK)
-			noise_remote_set_psk(&peer->p_remote, peer_o.p_psk);
+			awg_noise_remote_set_psk(&peer->p_remote, peer_o.p_psk);
 
 		if (peer_o.p_flags & AWG_PEER_HAS_PKA)
 			awg_timers_set_persistent_keepalive(&peer->p_timers,
-			    peer_o.p_pka);
+			    peer_o.p_pka, peer_o.p_pka_hi);
 
 		if (peer_o.p_flags & AWG_PEER_REPLACE_AIPS) {
 			LIST_FOREACH_SAFE(aip, &peer->p_aip, a_entry, taip) {
@@ -2547,7 +3246,13 @@ next_peer:
 		peer_p = (struct awg_peer_io *)aip_p;
 	}
 
-	/* AmneziaWG obfuscation parameters */
+	/* AmneziaWG obfuscation parameters, validated by awg_ioctl_check */
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_VERSION &&
+	    iface_o.i_version != sc->sc_awg_version) {
+		if (iface_o.i_version == AWG_VERSION_LEGACY)
+			awg_reset_3_1(sc, ispec);
+		sc->sc_awg_version = iface_o.i_version;
+	}
 	if (iface_o.i_flags & AWG_INTERFACE_HAS_JC) {
 		sc->sc_awg_jc   = iface_o.i_jc;
 		sc->sc_awg_jmin = iface_o.i_jmin;
@@ -2557,15 +3262,59 @@ next_peer:
 		sc->sc_awg_s1 = iface_o.i_s1;
 		sc->sc_awg_s2 = iface_o.i_s2;
 	}
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_S3)
+		sc->sc_awg_s3 = iface_o.i_s3;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_S4)
+		sc->sc_awg_s4 = iface_o.i_s4;
 	if (iface_o.i_flags & AWG_INTERFACE_HAS_H) {
 		sc->sc_awg_h1 = iface_o.i_h1;
 		sc->sc_awg_h2 = iface_o.i_h2;
 		sc->sc_awg_h3 = iface_o.i_h3;
 		sc->sc_awg_h4 = iface_o.i_h4;
 	}
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_HPK) {
+		/* An all-zero key turns header protection off */
+		sc->sc_awg_has_hpk = 0;
+		memcpy(sc->sc_awg_hpk, iface_o.i_hpk, AWG_HPK_LEN);
+		for (i = 0; i < AWG_HPK_LEN; i++)
+			sc->sc_awg_has_hpk |= iface_o.i_hpk[i] != 0;
+	}
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_CPA)
+		sc->sc_awg_cpa = iface_o.i_cpa;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_REKEY_AFTER_TIME)
+		sc->sc_awg_rekey_after_time = iface_o.i_rekey_after_time;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_REKEY_TIMEOUT)
+		sc->sc_awg_rekey_timeout = iface_o.i_rekey_timeout;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_REJECT_AFTER_TIME)
+		sc->sc_awg_reject_after_time = iface_o.i_reject_after_time;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_KEEPALIVE_TIMEOUT)
+		sc->sc_awg_keepalive_timeout = iface_o.i_keepalive_timeout;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_MAX_HANDSHAKE_ATTEMPTS)
+		sc->sc_awg_max_handshake_attempts =
+		    iface_o.i_max_handshake_attempts;
+	awg_update_noise_timings(sc);
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_TRAILERS)
+		sc->sc_awg_random_trailers = iface_o.i_random_trailers != 0;
+	if (iface_o.i_flags & AWG_INTERFACE_HAS_COOKIES)
+		sc->sc_awg_disable_cookies = iface_o.i_disable_cookies != 0;
+	for (i = 0; i < AWG_ISPEC_COUNT; i++) {
+		struct awg_ispec tmp;
+
+		if (!(iface_o.i_flags & AWG_INTERFACE_HAS_I(i)))
+			continue;
+		rw_enter_write(&sc->sc_ispec_lock);
+		tmp = sc->sc_awg_ispec[i];
+		sc->sc_awg_ispec[i] = ispec[i];
+		rw_exit_write(&sc->sc_ispec_lock);
+		ispec[i] = tmp;	/* freed below */
+	}
 
 error:
 	rw_exit_write(&sc->sc_lock);
+	for (i = 0; i < AWG_ISPEC_COUNT; i++)
+		awg_ispec_free(&ispec[i]);
+	if (ispec_buf != NULL)
+		free(ispec_buf, M_TEMP, AWG_ISPEC_MAXLEN);
 	explicit_bzero(&iface_o, sizeof(iface_o));
 	explicit_bzero(&peer_o, sizeof(peer_o));
 	explicit_bzero(&aip_o, sizeof(aip_o));
@@ -2583,8 +3332,11 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 
 	struct awg_peer		*peer;
 	struct awg_aip		*aip;
+	struct awg_ispec	*is;
 
-	size_t			 size, peer_count, aip_count;
+	char			*ubuf[AWG_ISPEC_COUNT];
+	size_t			 ulen[AWG_ISPEC_COUNT];
+	size_t			 size, peer_count, aip_count, i;
 	int			 ret = 0, is_suser = suser(curproc) == 0;
 
 	size = sizeof(struct awg_interface_io);
@@ -2609,7 +3361,7 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 	if (!is_suser)
 		goto copy_out_iface;
 
-	if (noise_local_keys(&sc->sc_local, iface_o.i_public,
+	if (awg_noise_local_keys(&sc->sc_local, iface_o.i_public,
 	    iface_o.i_private) == 0) {
 		iface_o.i_flags |= AWG_INTERFACE_HAS_PUBLIC;
 		iface_o.i_flags |= AWG_INTERFACE_HAS_PRIVATE;
@@ -2627,12 +3379,12 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 		peer_o.p_flags = AWG_PEER_HAS_PUBLIC;
 		peer_o.p_protocol_version = 1;
 
-		if (noise_remote_keys(&peer->p_remote, peer_o.p_public,
+		if (awg_noise_remote_keys(&peer->p_remote, peer_o.p_public,
 		    peer_o.p_psk) == 0)
 			peer_o.p_flags |= AWG_PEER_HAS_PSK;
 
 		if (awg_timers_get_persistent_keepalive(&peer->p_timers,
-		    &peer_o.p_pka) == 0)
+		    &peer_o.p_pka, &peer_o.p_pka_hi) == 0)
 			peer_o.p_flags |= AWG_PEER_HAS_PKA;
 
 		if (awg_peer_get_sockaddr(peer, &peer_o.p_sa) == 0)
@@ -2667,6 +3419,7 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 	iface_o.i_peers_count = peer_count;
 
 	/* AmneziaWG obfuscation parameters */
+	iface_o.i_version = sc->sc_awg_version;
 	iface_o.i_jc   = sc->sc_awg_jc;
 	iface_o.i_jmin = sc->sc_awg_jmin;
 	iface_o.i_jmax = sc->sc_awg_jmax;
@@ -2676,7 +3429,58 @@ awg_ioctl_get(struct awg_softc *sc, struct awg_data_io *data)
 	iface_o.i_h2   = sc->sc_awg_h2;
 	iface_o.i_h3   = sc->sc_awg_h3;
 	iface_o.i_h4   = sc->sc_awg_h4;
-	iface_o.i_flags |= AWG_INTERFACE_HAS_JC|AWG_INTERFACE_HAS_S12|AWG_INTERFACE_HAS_H;
+	iface_o.i_flags |= AWG_INTERFACE_HAS_VERSION|AWG_INTERFACE_HAS_JC|
+	    AWG_INTERFACE_HAS_S12|AWG_INTERFACE_HAS_H;
+
+	if (sc->sc_awg_version == AWG_VERSION_3_1) {
+		iface_o.i_s3 = sc->sc_awg_s3;
+		iface_o.i_s4 = sc->sc_awg_s4;
+		if (sc->sc_awg_has_hpk) {
+			memcpy(iface_o.i_hpk, sc->sc_awg_hpk, AWG_HPK_LEN);
+			iface_o.i_flags |= AWG_INTERFACE_HAS_HPK;
+		}
+		iface_o.i_cpa = sc->sc_awg_cpa;
+		iface_o.i_rekey_after_time = sc->sc_awg_rekey_after_time;
+		iface_o.i_rekey_timeout = sc->sc_awg_rekey_timeout;
+		iface_o.i_reject_after_time = sc->sc_awg_reject_after_time;
+		iface_o.i_keepalive_timeout = sc->sc_awg_keepalive_timeout;
+		iface_o.i_max_handshake_attempts =
+		    sc->sc_awg_max_handshake_attempts;
+		iface_o.i_random_trailers = sc->sc_awg_random_trailers;
+		iface_o.i_disable_cookies = sc->sc_awg_disable_cookies;
+		iface_o.i_flags |= AWG_INTERFACE_HAS_S3|AWG_INTERFACE_HAS_S4|
+		    AWG_INTERFACE_HAS_CPA|AWG_INTERFACE_HAS_REKEY_AFTER_TIME|
+		    AWG_INTERFACE_HAS_REKEY_TIMEOUT|
+		    AWG_INTERFACE_HAS_REJECT_AFTER_TIME|
+		    AWG_INTERFACE_HAS_KEEPALIVE_TIMEOUT|
+		    AWG_INTERFACE_HAS_MAX_HANDSHAKE_ATTEMPTS|
+		    AWG_INTERFACE_HAS_TRAILERS|AWG_INTERFACE_HAS_COOKIES;
+
+		/*
+		 * I1-I5 go to the buffers passed in i_ispec, i_ispec_len
+		 * returns the size needed.
+		 */
+		if ((ret = copyin(iface_p->i_ispec, ubuf, sizeof(ubuf))) != 0 ||
+		    (ret = copyin(iface_p->i_ispec_len, ulen,
+		    sizeof(ulen))) != 0)
+			goto unlock_and_ret_size;
+		rw_enter_read(&sc->sc_ispec_lock);
+		for (i = 0; i < AWG_ISPEC_COUNT; i++) {
+			is = &sc->sc_awg_ispec[i];
+			iface_o.i_ispec[i] = ubuf[i];
+			iface_o.i_ispec_len[i] = is->is_desc_size;
+			if (is->is_desc == NULL)
+				continue;
+			iface_o.i_flags |= AWG_INTERFACE_HAS_I(i);
+			if (ubuf[i] != NULL && ulen[i] >= is->is_desc_size &&
+			    (ret = copyout(is->is_desc, ubuf[i],
+			    is->is_desc_size)) != 0)
+				break;
+		}
+		rw_exit_read(&sc->sc_ispec_lock);
+		if (ret != 0)
+			goto unlock_and_ret_size;
+	}
 
 copy_out_iface:
 	ret = copyout(&iface_o, iface_p, sizeof(iface_o));
@@ -2796,7 +3600,7 @@ awg_down(struct awg_softc *sc)
 
 	taskq_barrier(awg_handshake_taskq);
 	TAILQ_FOREACH(peer, &sc->sc_peer_seq, p_seq_entry) {
-		noise_remote_clear(&peer->p_remote);
+		awg_noise_remote_clear(&peer->p_remote);
 		awg_timers_event_reset_handshake_last_sent(&peer->p_timers);
 	}
 
@@ -2810,7 +3614,7 @@ awg_clone_create(struct if_clone *ifc, int unit)
 {
 	struct ifnet		*ifp;
 	struct awg_softc		*sc;
-	struct noise_upcall	 local_upcall;
+	struct awg_noise_upcall	 local_upcall;
 
 	KERNEL_ASSERT_LOCKED();
 
@@ -2846,17 +3650,25 @@ awg_clone_create(struct if_clone *ifc, int unit)
 	arc4random_buf(&sc->sc_secret, sizeof(sc->sc_secret));
 
 	rw_init(&sc->sc_lock, "awg");
-	noise_local_init(&sc->sc_local, &local_upcall);
+	awg_noise_local_init(&sc->sc_local, &local_upcall);
 	if (cookie_checker_init(&sc->sc_cookie, &awg_ratelimit_pool) != 0)
 		goto ret_01;
 	sc->sc_udp_port = 0;
 	sc->sc_udp_rtable = 0;
 
-	/* AmneziaWG defaults (all zero = standard WireGuard behaviour) */
+	/*
+	 * AmneziaWG defaults (all zero = standard WireGuard behaviour),
+	 * legacy protocol until awgversion 3.1 is set.
+	 */
+	sc->sc_awg_version = AWG_VERSION_LEGACY;
 	sc->sc_awg_jc   = 0;  sc->sc_awg_jmin = 0;  sc->sc_awg_jmax = 0;
 	sc->sc_awg_s1   = 0;  sc->sc_awg_s2   = 0;
-	sc->sc_awg_h1   = 1;  sc->sc_awg_h2   = 2;
-	sc->sc_awg_h3   = 3;  sc->sc_awg_h4   = 4;
+	sc->sc_awg_s3   = 0;  sc->sc_awg_s4   = 0;
+	sc->sc_awg_h1.r_lo = sc->sc_awg_h1.r_hi = 1;
+	sc->sc_awg_h2.r_lo = sc->sc_awg_h2.r_hi = 2;
+	sc->sc_awg_h3.r_lo = sc->sc_awg_h3.r_hi = 3;
+	sc->sc_awg_h4.r_lo = sc->sc_awg_h4.r_hi = 4;
+	rw_init(&sc->sc_ispec_lock, "awg_ispec");
 
 	rw_init(&sc->sc_so_lock, "awg_so");
 	sc->sc_so4 = NULL;
@@ -2944,6 +3756,7 @@ awg_clone_destroy(struct ifnet *ifp)
 {
 	struct awg_softc	*sc = ifp->if_softc;
 	struct awg_peer	*peer, *tpeer;
+	int		 i;
 
 	KERNEL_ASSERT_LOCKED();
 
@@ -2973,6 +3786,9 @@ awg_clone_destroy(struct ifnet *ifp)
 #endif
 	free(sc->sc_aip4, M_RTABLE, sizeof(*sc->sc_aip4));
 	cookie_checker_deinit(&sc->sc_cookie);
+	for (i = 0; i < AWG_ISPEC_COUNT; i++)
+		awg_ispec_free(&sc->sc_awg_ispec[i]);
+	explicit_bzero(sc->sc_awg_hpk, sizeof(sc->sc_awg_hpk));
 	free(sc, M_DEVBUF, sizeof(*sc));
 	return 0;
 }
@@ -2981,8 +3797,7 @@ void
 awgattach(int nawg)
 {
 #ifdef AWGTEST
-	cookie_test();
-	noise_test();
+	awg_noise_test();
 #endif
 	if_clone_attach(&awg_cloner);
 

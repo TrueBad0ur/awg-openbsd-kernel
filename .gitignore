@@ -5,12 +5,6 @@
 *.orig
 *.debug
 *.o
-awgtest
-awgtest.c
-
-# Old intermediate diffs (superseded by awg-openbsd.patch)
-awgmp.diff
-conf_files.diff
 
 # Misc
 ktrace.out

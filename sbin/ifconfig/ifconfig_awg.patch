@@ -1,5 +1,5 @@
 --- /usr/src/sbin/ifconfig/ifconfig.c.orig	Tue Jun 23 13:48:24 2026
-+++ /usr/src/sbin/ifconfig/ifconfig.c	Tue Jun 23 13:52:46 2026
++++ /usr/src/sbin/ifconfig/ifconfig.c	Thu Sep 24 04:27:53 2026
 @@ -83,6 +83,7 @@
  #include <net/if_pppoe.h>
  #include <net/if_trunk.h>
@@ -8,7 +8,7 @@
  #include <net/trunklacp.h>
  #include <net/if_sppp.h>
  #include <net/ppp_defs.h>
-@@ -366,6 +367,30 @@
+@@ -366,6 +367,52 @@
  void	unsetwgpeerall(const char *, int);
  
  void	wg_status(int);
@@ -31,15 +31,37 @@
 +void	setawgh2(const char *, int);
 +void	setawgh3(const char *, int);
 +void	setawgh4(const char *, int);
++void	setawgversion(const char *, int);
++void	setawgs3(const char *, int);
++void	setawgs4(const char *, int);
++void	setawgi1(const char *, int);
++void	setawgi2(const char *, int);
++void	setawgi3(const char *, int);
++void	setawgi4(const char *, int);
++void	setawgi5(const char *, int);
++void	setawghpk(const char *, int);
++void	unsetawghpk(const char *, int);
++void	setawgcpa(const char *, int);
++void	setawgrekeyaftertime(const char *, int);
++void	setawgrekeytimeout(const char *, int);
++void	setawgrejectaftertime(const char *, int);
++void	setawgkeepalivetimeout(const char *, int);
++void	setawgmaxhandshakeattempts(const char *, int);
++void	setawgrandomtrailers(const char *, int);
++void	setawgdisablecookies(const char *, int);
 +void	unsetawgpeer(const char *, int);
 +void	unsetawgpeerdesc(const char *, int);
 +void	unsetawgpeerpsk(const char *, int);
 +void	unsetawgpeerall(const char *, int);
 +void	awg_status(int);
++void	parseawgrange(const char *, long long, struct awg_range *,
++	    const char *);
++void	setawgispec(int, const char *);
++void	awg_print_range(const char *, struct awg_range *);
  #else
  void	setignore(const char *, int);
  #endif
-@@ -394,6 +419,7 @@
+@@ -394,6 +441,7 @@
  #define	A_MEDIAMODE	0x0010		/* mode command */
  #define	A_JOIN		0x0020		/* join */
  #define	A_WIREGUARD	0x0040		/* any WireGuard command */
@@ -47,7 +69,7 @@
  #define A_SILENT	0x8000000	/* doing operation, do not print */
  
  #define	NEXTARG0	0xffffff
-@@ -657,6 +683,31 @@
+@@ -657,6 +705,51 @@
  	{ "-wgdescr",	0,		A_WIREGUARD,	unsetwgpeerdesc},
  	{ "-wgpeerall",	0,		A_WIREGUARD,	unsetwgpeerall},
  
@@ -70,6 +92,26 @@
 +	{ "awgh2",	NEXTARG,	A_AMNEZIAWG,	setawgh2},
 +	{ "awgh3",	NEXTARG,	A_AMNEZIAWG,	setawgh3},
 +	{ "awgh4",	NEXTARG,	A_AMNEZIAWG,	setawgh4},
++	{ "awgversion",	NEXTARG,	A_AMNEZIAWG,	setawgversion},
++	{ "awgs3",	NEXTARG,	A_AMNEZIAWG,	setawgs3},
++	{ "awgs4",	NEXTARG,	A_AMNEZIAWG,	setawgs4},
++	{ "awgi1",	NEXTARG,	A_AMNEZIAWG,	setawgi1},
++	{ "awgi2",	NEXTARG,	A_AMNEZIAWG,	setawgi2},
++	{ "awgi3",	NEXTARG,	A_AMNEZIAWG,	setawgi3},
++	{ "awgi4",	NEXTARG,	A_AMNEZIAWG,	setawgi4},
++	{ "awgi5",	NEXTARG,	A_AMNEZIAWG,	setawgi5},
++	{ "awghpk",	NEXTARG,	A_AMNEZIAWG,	setawghpk},
++	{ "-awghpk",	0,		A_AMNEZIAWG,	unsetawghpk},
++	{ "awgcpa",	NEXTARG,	A_AMNEZIAWG,	setawgcpa},
++	{ "awgrekeyaftertime", NEXTARG,	A_AMNEZIAWG,	setawgrekeyaftertime},
++	{ "awgrekeytimeout", NEXTARG,	A_AMNEZIAWG,	setawgrekeytimeout},
++	{ "awgrejectaftertime", NEXTARG, A_AMNEZIAWG,	setawgrejectaftertime},
++	{ "awgkeepalivetimeout", NEXTARG, A_AMNEZIAWG,	setawgkeepalivetimeout},
++	{ "awgmaxhandshakeattempts", NEXTARG, A_AMNEZIAWG, setawgmaxhandshakeattempts},
++	{ "awgrandomtrailers", 1,	A_AMNEZIAWG,	setawgrandomtrailers},
++	{ "-awgrandomtrailers", 0,	A_AMNEZIAWG,	setawgrandomtrailers},
++	{ "awgdisablecookies", 1,	A_AMNEZIAWG,	setawgdisablecookies},
++	{ "-awgdisablecookies", 0,	A_AMNEZIAWG,	setawgdisablecookies},
 +	{ "-awgpeer",	NEXTARG,	A_AMNEZIAWG,	unsetawgpeer},
 +	{ "-awgpsk",	0,		A_AMNEZIAWG,	unsetawgpeerpsk},
 +	{ "-awgdescription", 0,	A_AMNEZIAWG,	unsetawgpeerdesc},
@@ -79,7 +121,7 @@
  #else /* SMALL */
  	{ "powersave",	NEXTARG0,	0,		setignore },
  	{ "priority",	NEXTARG,	0,		setignore },
-@@ -730,6 +781,7 @@
+@@ -730,6 +823,7 @@
  void	process_join_commands(void);
  
  void	process_wg_commands(void);
@@ -87,7 +129,7 @@
  
  void	in_status(int);
  void	in_getaddr(const char *, int);
-@@ -980,6 +1032,7 @@
+@@ -980,6 +1074,7 @@
  
  #ifndef SMALL
  	process_wg_commands();
@@ -95,7 +137,7 @@
  #endif
  
  	process_join_commands();
-@@ -3410,6 +3463,7 @@
+@@ -3410,6 +3505,7 @@
  	pflow_status();
  	umb_status();
  	wg_status(ifaliases);
@@ -103,11 +145,10 @@
  #endif
  	trunk_status();
  	getifgroups();
-@@ -6056,6 +6110,422 @@
- out:
+@@ -6057,6 +6153,669 @@
  	free(wgdata.wgd_interface);
  }
-+
+ 
 +
 +/* AmneziaWG implementation */
 +
@@ -162,6 +203,29 @@
 +		awgi_aip = (void *)awgi_interface + aip_offset;
 +
 +	bzero((char *)awgi_interface + awgdata.awgd_size - by, by);
++}
++
++/* "N" or "N-M", both ends at most max */
++void
++parseawgrange(const char *val, long long max, struct awg_range *r,
++    const char *name)
++{
++	const char *errmsg = NULL;
++	char *buf, *hi;
++
++	if ((buf = strdup(val)) == NULL)
++		err(1, "strdup");
++	if ((hi = strchr(buf, '-')) != NULL)
++		*hi++ = '\0';
++	r->r_lo = strtonum(buf, 0, max, &errmsg);
++	if (errmsg)
++		errx(1, "%s: %s, %s", name, val, errmsg);
++	r->r_hi = hi != NULL ? strtonum(hi, 0, max, &errmsg) : r->r_lo;
++	if (errmsg)
++		errx(1, "%s: %s, %s", name, val, errmsg);
++	if (r->r_hi < r->r_lo)
++		errx(1, "%s: %s, invalid range", name, val);
++	free(buf);
 +}
 +
 +void
@@ -243,13 +307,14 @@
 +void
 +setawgpeerpka(const char *pka, int param)
 +{
-+	const char *errmsg = NULL;
++	struct awg_range r;
++
 +	if (awgi_peer == NULL)
 +		errx(1, "awgpka: awgpeer not set");
 +	awgi_peer->p_flags |= AWG_PEER_HAS_PKA;
-+	awgi_peer->p_pka = strtonum(pka, 0, 43200, &errmsg);
-+	if (errmsg)
-+		errx(1, "awgpka: %s, %s", pka, errmsg);
++	parseawgrange(pka, 43200, &r, "awgpka");
++	awgi_peer->p_pka = r.r_lo;
++	awgi_peer->p_pka_hi = r.r_hi != r.r_lo ? r.r_hi : 0;
 +}
 +
 +void
@@ -340,45 +405,194 @@
 +void
 +setawgh1(const char *val, int param)
 +{
-+	const char *errmsg = NULL;
 +	ensureawginterface();
 +	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
-+	awgi_interface->i_h1 = strtonum(val, 0, 4294967295LL, &errmsg);
-+	if (errmsg)
-+		errx(1, "awgh1: %s, %s", val, errmsg);
++	parseawgrange(val, 4294967295LL, &awgi_interface->i_h1, "awgh1");
 +}
 +
 +void
 +setawgh2(const char *val, int param)
 +{
-+	const char *errmsg = NULL;
 +	ensureawginterface();
 +	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
-+	awgi_interface->i_h2 = strtonum(val, 0, 4294967295LL, &errmsg);
-+	if (errmsg)
-+		errx(1, "awgh2: %s, %s", val, errmsg);
++	parseawgrange(val, 4294967295LL, &awgi_interface->i_h2, "awgh2");
 +}
 +
 +void
 +setawgh3(const char *val, int param)
 +{
-+	const char *errmsg = NULL;
 +	ensureawginterface();
 +	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
-+	awgi_interface->i_h3 = strtonum(val, 0, 4294967295LL, &errmsg);
-+	if (errmsg)
-+		errx(1, "awgh3: %s, %s", val, errmsg);
++	parseawgrange(val, 4294967295LL, &awgi_interface->i_h3, "awgh3");
 +}
 +
 +void
 +setawgh4(const char *val, int param)
 +{
-+	const char *errmsg = NULL;
 +	ensureawginterface();
 +	awgi_interface->i_flags |= AWG_INTERFACE_HAS_H;
-+	awgi_interface->i_h4 = strtonum(val, 0, 4294967295LL, &errmsg);
++	parseawgrange(val, 4294967295LL, &awgi_interface->i_h4, "awgh4");
++}
++
++void
++setawgversion(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_VERSION;
++	if (strcmp(val, "legacy") == 0)
++		awgi_interface->i_version = AWG_VERSION_LEGACY;
++	else if (strcmp(val, "3.1") == 0)
++		awgi_interface->i_version = AWG_VERSION_3_1;
++	else
++		errx(1, "awgversion: %s, must be legacy or 3.1", val);
++}
++
++void
++setawgs3(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_S3;
++	awgi_interface->i_s3 = strtonum(val, 0, 65535, &errmsg);
 +	if (errmsg)
-+		errx(1, "awgh4: %s, %s", val, errmsg);
++		errx(1, "awgs3: %s, %s", val, errmsg);
++}
++
++void
++setawgs4(const char *val, int param)
++{
++	const char *errmsg = NULL;
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_S4;
++	awgi_interface->i_s4 = strtonum(val, 0, 65535, &errmsg);
++	if (errmsg)
++		errx(1, "awgs4: %s, %s", val, errmsg);
++}
++
++/* I1-I5 tag strings, parsed by the kernel; "" clears */
++void
++setawgispec(int n, const char *val)
++{
++	ensureawginterface();
++	if (strlen(val) >= AWG_ISPEC_MAXLEN)
++		errx(1, "awgi%d: too long", n + 1);
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_I(n);
++	awgi_interface->i_ispec[n] = (char *)val;
++}
++
++void
++setawgi1(const char *val, int param)
++{
++	setawgispec(0, val);
++}
++
++void
++setawgi2(const char *val, int param)
++{
++	setawgispec(1, val);
++}
++
++void
++setawgi3(const char *val, int param)
++{
++	setawgispec(2, val);
++}
++
++void
++setawgi4(const char *val, int param)
++{
++	setawgispec(3, val);
++}
++
++void
++setawgi5(const char *val, int param)
++{
++	setawgispec(4, val);
++}
++
++void
++setawghpk(const char *hpk_b64, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_HPK;
++	AWG_LOAD_KEY(awgi_interface->i_hpk, hpk_b64, "awghpk");
++}
++
++void
++unsetawghpk(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_HPK;
++	bzero(awgi_interface->i_hpk, AWG_HPK_LEN);
++}
++
++void
++setawgcpa(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_CPA;
++	parseawgrange(val, 65535, &awgi_interface->i_cpa, "awgcpa");
++}
++
++void
++setawgrekeyaftertime(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_REKEY_AFTER_TIME;
++	parseawgrange(val, 65535, &awgi_interface->i_rekey_after_time,
++	    "awgrekeyaftertime");
++}
++
++void
++setawgrekeytimeout(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_REKEY_TIMEOUT;
++	parseawgrange(val, 65535, &awgi_interface->i_rekey_timeout,
++	    "awgrekeytimeout");
++}
++
++void
++setawgrejectaftertime(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_REJECT_AFTER_TIME;
++	parseawgrange(val, 65535, &awgi_interface->i_reject_after_time,
++	    "awgrejectaftertime");
++}
++
++void
++setawgkeepalivetimeout(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_KEEPALIVE_TIMEOUT;
++	parseawgrange(val, 65535, &awgi_interface->i_keepalive_timeout,
++	    "awgkeepalivetimeout");
++}
++
++void
++setawgmaxhandshakeattempts(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_MAX_HANDSHAKE_ATTEMPTS;
++	parseawgrange(val, 65535, &awgi_interface->i_max_handshake_attempts,
++	    "awgmaxhandshakeattempts");
++}
++
++void
++setawgrandomtrailers(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_TRAILERS;
++	awgi_interface->i_random_trailers = param;
++}
++
++void
++setawgdisablecookies(const char *val, int param)
++{
++	ensureawginterface();
++	awgi_interface->i_flags |= AWG_INTERFACE_HAS_COOKIES;
++	awgi_interface->i_disable_cookies = param;
 +}
 +
 +void
@@ -425,12 +639,27 @@
 +}
 +
 +void
++awg_print_range(const char *name, struct awg_range *r)
++{
++	if (r->r_lo == r->r_hi)
++		printf("%s %u", name, r->r_lo);
++	else
++		printf("%s %u-%u", name, r->r_lo, r->r_hi);
++}
++
++void
 +awg_status(int ifaliases)
 +{
++	static char		 ispec[AWG_ISPEC_COUNT][AWG_ISPEC_MAXLEN];
 +	size_t			 i, j, last_size;
 +	struct timespec		 now;
 +	char			 hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
 +	char			 key[AWG_BASE64_KEY_LEN + 1];
++	struct awg_range	*timing[5];
++	const char		*timing_name[5] = { "awgrekeyaftertime",
++				    "awgrekeytimeout", "awgrejectaftertime",
++				    "awgkeepalivetimeout",
++				    "awgmaxhandshakeattempts" };
 +
 +	strlcpy(awgdata.awgd_name, ifname, sizeof(awgdata.awgd_name));
 +	awgdata.awgd_size = 0;
@@ -447,6 +676,12 @@
 +		    awgdata.awgd_size);
 +		if (!awgdata.awgd_interface)
 +			err(1, "realloc");
++		/* The kernel copies I1-I5 into these buffers */
++		for (i = 0; i < AWG_ISPEC_COUNT; i++) {
++			awgdata.awgd_interface->i_ispec[i] = ispec[i];
++			awgdata.awgd_interface->i_ispec_len[i] =
++			    sizeof(ispec[i]);
++		}
 +	}
 +	awgi_interface = awgdata.awgd_interface;
 +
@@ -459,17 +694,63 @@
 +		    key, sizeof(key));
 +		printf("\tawgpubkey %s\n", key);
 +	}
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_VERSION)
++		printf("\tawgversion %s\n",
++		    awgi_interface->i_version == AWG_VERSION_3_1 ?
++		    "3.1" : "legacy");
 +	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_JC)
 +		printf("\tawgjc %u awgjmin %u awgjmax %u\n",
 +		    awgi_interface->i_jc, awgi_interface->i_jmin,
 +		    awgi_interface->i_jmax);
-+	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_S12)
-+		printf("\tawgs1 %u awgs2 %u\n",
-+		    awgi_interface->i_s1, awgi_interface->i_s2);
-+	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_H)
-+		printf("\tawgh1 %u awgh2 %u awgh3 %u awgh4 %u\n",
-+		    awgi_interface->i_h1, awgi_interface->i_h2,
-+		    awgi_interface->i_h3, awgi_interface->i_h4);
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_S12) {
++		printf("\tawgs1 %u awgs2 %u", awgi_interface->i_s1,
++		    awgi_interface->i_s2);
++		if (awgi_interface->i_flags & AWG_INTERFACE_HAS_S3)
++			printf(" awgs3 %u", awgi_interface->i_s3);
++		if (awgi_interface->i_flags & AWG_INTERFACE_HAS_S4)
++			printf(" awgs4 %u", awgi_interface->i_s4);
++		printf("\n");
++	}
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_H) {
++		printf("\t");
++		awg_print_range("awgh1", &awgi_interface->i_h1);
++		awg_print_range(" awgh2", &awgi_interface->i_h2);
++		awg_print_range(" awgh3", &awgi_interface->i_h3);
++		awg_print_range(" awgh4", &awgi_interface->i_h4);
++		printf("\n");
++	}
++	for (i = 0; i < AWG_ISPEC_COUNT; i++)
++		if (awgi_interface->i_flags & AWG_INTERFACE_HAS_I(i) &&
++		    awgi_interface->i_ispec_len[i] <= sizeof(ispec[i]))
++			printf("\tawgi%zu %s\n", i + 1, ispec[i]);
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_HPK)
++		printf("\tawghpk (present)\n");
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_CPA &&
++	    awgi_interface->i_cpa.r_hi != 0) {
++		printf("\t");
++		awg_print_range("awgcpa", &awgi_interface->i_cpa);
++		printf("\n");
++	}
++	timing[0] = &awgi_interface->i_rekey_after_time;
++	timing[1] = &awgi_interface->i_rekey_timeout;
++	timing[2] = &awgi_interface->i_reject_after_time;
++	timing[3] = &awgi_interface->i_keepalive_timeout;
++	timing[4] = &awgi_interface->i_max_handshake_attempts;
++	for (i = 0; i < 5; i++) {
++		if (!(awgi_interface->i_flags &
++		    (AWG_INTERFACE_HAS_REKEY_AFTER_TIME << i)) ||
++		    timing[i]->r_hi == 0)
++			continue;
++		printf("\t");
++		awg_print_range(timing_name[i], timing[i]);
++		printf("\n");
++	}
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_TRAILERS &&
++	    awgi_interface->i_random_trailers)
++		printf("\tawgrandomtrailers\n");
++	if (awgi_interface->i_flags & AWG_INTERFACE_HAS_COOKIES &&
++	    awgi_interface->i_disable_cookies)
++		printf("\tawgdisablecookies\n");
 +
 +	if (ifaliases) {
 +		awgi_peer = &awgi_interface->i_peers[0];
@@ -486,8 +767,15 @@
 +				printf("\t\tawgpsk (present)\n");
 +
 +			if (awgi_peer->p_flags & AWG_PEER_HAS_PKA &&
-+			    awgi_peer->p_pka)
-+				printf("\t\tawgpka %u (sec)\n", awgi_peer->p_pka);
++			    awgi_peer->p_pka) {
++				if (awgi_peer->p_pka_hi > awgi_peer->p_pka)
++					printf("\t\tawgpka %u-%u (sec)\n",
++					    awgi_peer->p_pka,
++					    awgi_peer->p_pka_hi);
++				else
++					printf("\t\tawgpka %u (sec)\n",
++					    awgi_peer->p_pka);
++			}
 +
 +			if (awgi_peer->p_flags & AWG_PEER_HAS_ENDPOINT) {
 +				if (getnameinfo(&awgi_peer->p_sa,
@@ -523,6 +811,7 @@
 +	free(awgdata.awgd_interface);
 +}
 +
- 
++
  const struct umb_valdescr umb_regstate[] = MBIM_REGSTATE_DESCRIPTIONS;
  const struct umb_valdescr umb_dataclass[] = MBIM_DATACLASS_DESCRIPTIONS;
+ const struct umb_valdescr umb_simstate[] = MBIM_SIMSTATE_DESCRIPTIONS;

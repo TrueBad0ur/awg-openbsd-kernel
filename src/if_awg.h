@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_awg.h,v 1.0 2026/06/23 00:00:00 truebad0ur Exp $ */
+/*	$OpenBSD: if_awg.h,v 1.1 2026/09/24 00:00:00 truebad0ur Exp $ */
 
 /*
  * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
@@ -8,7 +8,7 @@
  * AmneziaWG kernel driver public interface for OpenBSD.
  * Based on if_wg.h from OpenBSD src/sys/net/.
  * Interface: awg0, awg1, ...
- * Ioctls: SIOCSAWG (212), SIOCGAWG (213)
+ * Ioctls: SIOCSAWG (223), SIOCGAWG (224)
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -31,8 +31,28 @@
 
 #define AWG_KEY_LEN 32
 
-#define SIOCSAWG _IOWR('i', 212, struct awg_data_io)
-#define SIOCGAWG _IOWR('i', 213, struct awg_data_io)
+/*
+ * 223/224 instead of the original 212/213: the structures below changed
+ * with AWG 3.1 support, so a stale ifconfig(8) gets ENOTTY instead of
+ * passing a mismatched layout to the kernel.
+ */
+#define SIOCSAWG _IOWR('i', 223, struct awg_data_io)
+#define SIOCGAWG _IOWR('i', 224, struct awg_data_io)
+
+/* Protocol versions selectable with awgversion */
+#define AWG_VERSION_LEGACY	0	/* AmneziaWG < 3.1: Jc/Jmin/Jmax/S1/S2/H1-H4 */
+#define AWG_VERSION_3_1		1	/* AmneziaWG >= 3.1 */
+
+#define AWG_HPK_LEN		32	/* HeaderProtectionKey */
+#define AWG_HPK_NONCE_LEN	12	/* S1-S4 must be at least this long */
+#define AWG_ISPEC_COUNT		5	/* I1-I5 */
+#define AWG_ISPEC_MAXLEN	8192	/* incl. NUL */
+
+/* Inclusive range; lo == hi is a single value, 0-0 means unset */
+struct awg_range {
+	uint32_t		r_lo;
+	uint32_t		r_hi;
+};
 
 #define a_ipv4	a_addr.addr_ipv4
 #define a_ipv6	a_addr.addr_ipv6
@@ -66,6 +86,7 @@ struct awg_peer_io {
 	uint8_t			p_public[AWG_KEY_LEN];
 	uint8_t			p_psk[AWG_KEY_LEN];
 	uint16_t		p_pka;
+	uint16_t		p_pka_hi;	/* 3.1: PersistentKeepalive range */
 	union awg_peer_endpoint {
 		struct sockaddr		sa_sa;
 		struct sockaddr_in	sa_sin;
@@ -89,6 +110,22 @@ struct awg_peer_io {
 #define AWG_INTERFACE_HAS_JC		(1 << 5)  /* jc/jmin/jmax set */
 #define AWG_INTERFACE_HAS_S12		(1 << 6)  /* s1/s2 set */
 #define AWG_INTERFACE_HAS_H		(1 << 7)  /* h1/h2/h3/h4 set */
+#define AWG_INTERFACE_HAS_VERSION	(1 << 8)
+/* AmneziaWG 3.1 flags, rejected in legacy mode */
+#define AWG_INTERFACE_HAS_S3		(1 << 9)
+#define AWG_INTERFACE_HAS_S4		(1 << 10)
+#define AWG_INTERFACE_HAS_HPK		(1 << 11) /* header protection key */
+#define AWG_INTERFACE_HAS_CPA		(1 << 12) /* content padding addition */
+#define AWG_INTERFACE_HAS_REKEY_AFTER_TIME (1 << 13)
+#define AWG_INTERFACE_HAS_REKEY_TIMEOUT	(1 << 14)
+#define AWG_INTERFACE_HAS_REJECT_AFTER_TIME (1 << 15)
+#define AWG_INTERFACE_HAS_KEEPALIVE_TIMEOUT (1 << 16)
+#define AWG_INTERFACE_HAS_MAX_HANDSHAKE_ATTEMPTS (1 << 17)
+#define AWG_INTERFACE_HAS_TRAILERS	(1 << 18) /* random trailers */
+#define AWG_INTERFACE_HAS_COOKIES	(1 << 19) /* disable cookies */
+#define AWG_INTERFACE_HAS_I1		(1 << 20) /* I1..I5: HAS_I(0..4) */
+#define AWG_INTERFACE_HAS_I(n)		(AWG_INTERFACE_HAS_I1 << (n))
+#define AWG_INTERFACE_HAS_3_1		(0xffffU << 9)	  /* bits 9-24 */
 
 struct awg_interface_io {
 	uint32_t		i_flags;
@@ -102,10 +139,28 @@ struct awg_interface_io {
 	uint16_t		i_jmax;		/* junk packet max size (bytes) */
 	uint16_t		i_s1;		/* init packet junk prefix size */
 	uint16_t		i_s2;		/* response packet junk prefix size */
-	uint32_t		i_h1;		/* init magic header (default 1) */
-	uint32_t		i_h2;		/* response magic header (default 2) */
-	uint32_t		i_h3;		/* cookie magic header (default 3) */
-	uint32_t		i_h4;		/* transport magic header (default 4) */
+	uint16_t		i_s3;		/* cookie packet junk prefix size */
+	uint16_t		i_s4;		/* transport packet junk prefix size */
+	struct awg_range	i_h1;		/* init magic header (default 1) */
+	struct awg_range	i_h2;		/* response magic header (default 2) */
+	struct awg_range	i_h3;		/* cookie magic header (default 3) */
+	struct awg_range	i_h4;		/* transport magic header (default 4) */
+	uint8_t			i_version;	/* AWG_VERSION_* */
+	uint8_t			i_random_trailers;
+	uint8_t			i_disable_cookies;
+	uint8_t			i_hpk[AWG_HPK_LEN];
+	struct awg_range	i_cpa;		/* ContentPaddingAddition */
+	struct awg_range	i_rekey_after_time;
+	struct awg_range	i_rekey_timeout;
+	struct awg_range	i_reject_after_time;
+	struct awg_range	i_keepalive_timeout;
+	struct awg_range	i_max_handshake_attempts;
+	/*
+	 * I1-I5 tag strings, userland pointers. Set: NUL-terminated string.
+	 * Get: buffer of i_ispec_len[n] bytes, filled when non-NULL.
+	 */
+	char			*i_ispec[AWG_ISPEC_COUNT];
+	size_t			 i_ispec_len[AWG_ISPEC_COUNT];
 	size_t			i_peers_count;
 	struct awg_peer_io	i_peers[];
 };
