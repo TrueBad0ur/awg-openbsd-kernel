@@ -1,4 +1,4 @@
-/*	$OpenBSD: if_awg.c,v 1.1 2026/09/24 00:00:00 truebad0ur Exp $ */
+/*	$OpenBSD: if_awg.c,v 1.2 2026/10/20 00:00:00 truebad0ur Exp $ */
 
 /*
  * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
@@ -892,22 +892,24 @@ awg_socket_close(struct socket **so)
 int
 awg_bind(struct awg_softc *sc, in_port_t *portp, int *rtablep)
 {
-	int		 ret = 0, rtable = *rtablep;
-	in_port_t	 port = *portp;
+	int		 ret = 0, rtable;
+	in_port_t	 port;
 	struct socket	*so4;
 #ifdef INET6
 	struct socket	*so6;
 	int		 retries = 0;
 retry:
 #endif
+	port = *portp;
+	rtable = *rtablep;
 	if ((ret = awg_socket_open(&so4, AF_INET, &port, &rtable, sc)) != 0)
 		return ret;
 
 #ifdef INET6
 	if ((ret = awg_socket_open(&so6, AF_INET6, &port, &rtable, sc)) != 0) {
+		awg_socket_close(&so4);
 		if (ret == EADDRINUSE && *portp == 0 && retries++ < 100)
 			goto retry;
-		awg_socket_close(&so4);
 		return ret;
 	}
 #endif
@@ -2850,6 +2852,13 @@ awg_qstart(struct ifqueue *ifq)
 	while ((m = ifq_dequeue(ifq)) != NULL) {
 		t = awg_tag_get(m);
 		peer = t->t_peer;
+
+#if NBPFILTER > 0
+		if (sc->sc_if.if_bpf)
+			bpf_mtap_af(sc->sc_if.if_bpf, m->m_pkthdr.ph_family, m,
+			    BPF_DIRECTION_OUT);
+#endif
+
 		if (mq_push(&peer->p_stage_queue, m) != 0)
 			counters_inc(ifp->if_counters, ifc_oqdrops);
 		if (!peer->p_start_onlist) {
@@ -2896,12 +2905,6 @@ awg_output(struct ifnet *ifp, struct mbuf *m, struct sockaddr *sa,
 		ret = EAFNOSUPPORT;
 		goto error;
 	}
-
-#if NBPFILTER > 0
-	if (sc->sc_if.if_bpf)
-		bpf_mtap_af(sc->sc_if.if_bpf, sa->sa_family, m,
-		    BPF_DIRECTION_OUT);
-#endif
 
 	if (peer == NULL) {
 		ret = ENETUNREACH;

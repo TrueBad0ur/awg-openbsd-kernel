@@ -1,6 +1,6 @@
 #!/bin/sh
 # AmneziaWG for OpenBSD — install script
-# Run as root on OpenBSD 7.x amd64
+# Run as root on OpenBSD 7.x or 8.x amd64
 #
 # Usage:
 #   sh install.sh --tools-only   # patch + rebuild ifconfig, install awg-quick (no reboot)
@@ -56,6 +56,12 @@ fetch_sys_sources() {
     else
         log "Kernel sources already present"
     fi
+
+    # After sysupgrade the old release's sources are still in place
+    local srcver
+    srcver=$(sed -n 's/^osr="\(.*\)"$/\1/p' "$SRCDIR/conf/newvers.sh")
+    [ "$srcver" = "$(uname -r)" ] \
+        || die "$SRCDIR is OpenBSD $srcver, system is $(uname -r): move $SRCDIR and $IFCFG_SRC aside and rerun to fetch matching sources"
 }
 
 # ── 3. ifconfig patch ─────────────────────────────────────────────────────────

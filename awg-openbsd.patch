@@ -1,5 +1,5 @@
---- /dev/null	Thu Sep 24 07:41:56 2026
-+++ net/if_awg.h	Thu Sep 24 07:41:56 2026
+--- /dev/null	Tue Oct 20 05:19:09 2026
++++ net/if_awg.h	Tue Oct 20 05:19:09 2026
 @@ -0,0 +1,174 @@
 +/*	$OpenBSD: if_awg.h,v 1.1 2026/09/24 00:00:00 truebad0ur Exp $ */
 +
@@ -176,10 +176,10 @@
 +
 +#endif /* __IF_AWG_H__ */
 
---- /dev/null	Thu Sep 24 07:41:56 2026
-+++ net/if_awg.c	Thu Sep 24 07:41:56 2026
-@@ -0,0 +1,3810 @@
-+/*	$OpenBSD: if_awg.c,v 1.1 2026/09/24 00:00:00 truebad0ur Exp $ */
+--- /dev/null	Tue Oct 20 05:19:09 2026
++++ net/if_awg.c	Tue Oct 20 05:19:09 2026
+@@ -0,0 +1,3813 @@
++/*	$OpenBSD: if_awg.c,v 1.2 2026/10/20 00:00:00 truebad0ur Exp $ */
 +
 +/*
 + * Copyright (C) 2026 Andrey Orekhov <pieceofcakecupofcoffee@gmail.com>
@@ -1073,22 +1073,24 @@
 +int
 +awg_bind(struct awg_softc *sc, in_port_t *portp, int *rtablep)
 +{
-+	int		 ret = 0, rtable = *rtablep;
-+	in_port_t	 port = *portp;
++	int		 ret = 0, rtable;
++	in_port_t	 port;
 +	struct socket	*so4;
 +#ifdef INET6
 +	struct socket	*so6;
 +	int		 retries = 0;
 +retry:
 +#endif
++	port = *portp;
++	rtable = *rtablep;
 +	if ((ret = awg_socket_open(&so4, AF_INET, &port, &rtable, sc)) != 0)
 +		return ret;
 +
 +#ifdef INET6
 +	if ((ret = awg_socket_open(&so6, AF_INET6, &port, &rtable, sc)) != 0) {
++		awg_socket_close(&so4);
 +		if (ret == EADDRINUSE && *portp == 0 && retries++ < 100)
 +			goto retry;
-+		awg_socket_close(&so4);
 +		return ret;
 +	}
 +#endif
@@ -3031,6 +3033,13 @@
 +	while ((m = ifq_dequeue(ifq)) != NULL) {
 +		t = awg_tag_get(m);
 +		peer = t->t_peer;
++
++#if NBPFILTER > 0
++		if (sc->sc_if.if_bpf)
++			bpf_mtap_af(sc->sc_if.if_bpf, m->m_pkthdr.ph_family, m,
++			    BPF_DIRECTION_OUT);
++#endif
++
 +		if (mq_push(&peer->p_stage_queue, m) != 0)
 +			counters_inc(ifp->if_counters, ifc_oqdrops);
 +		if (!peer->p_start_onlist) {
@@ -3077,12 +3086,6 @@
 +		ret = EAFNOSUPPORT;
 +		goto error;
 +	}
-+
-+#if NBPFILTER > 0
-+	if (sc->sc_if.if_bpf)
-+		bpf_mtap_af(sc->sc_if.if_bpf, sa->sa_family, m,
-+		    BPF_DIRECTION_OUT);
-+#endif
 +
 +	if (peer == NULL) {
 +		ret = ENETUNREACH;
@@ -3990,8 +3993,8 @@
 +			IPL_NET, 0, "awgratelimit", NULL);
 +}
 
---- /dev/null	Thu Sep 24 07:41:56 2026
-+++ net/awg_noise.h	Thu Sep 24 07:41:56 2026
+--- /dev/null	Tue Oct 20 05:19:09 2026
++++ net/awg_noise.h	Tue Oct 20 05:19:09 2026
 @@ -0,0 +1,212 @@
 +/*	$OpenBSD: awg_noise.h,v 1.0 2026/09/24 00:00:00 truebad0ur Exp $ */
 +/*
@@ -4206,8 +4209,8 @@
 +
 +#endif /* __AWG_NOISE_H__ */
 
---- /dev/null	Thu Sep 24 07:41:56 2026
-+++ net/awg_noise.c	Thu Sep 24 07:41:56 2026
+--- /dev/null	Tue Oct 20 05:19:09 2026
++++ net/awg_noise.c	Tue Oct 20 05:19:09 2026
 @@ -0,0 +1,1405 @@
 +/*	$OpenBSD: awg_noise.c,v 1.0 2026/09/24 00:00:00 truebad0ur Exp $ */
 +/*

@@ -1,14 +1,14 @@
---- /usr/src/sbin/ifconfig/ifconfig.c.orig	Tue Jun 23 13:48:24 2026
-+++ /usr/src/sbin/ifconfig/ifconfig.c	Thu Sep 24 04:27:53 2026
-@@ -83,6 +83,7 @@
+--- /usr/src/sbin/ifconfig/ifconfig.c.orig	Tue Oct 20 09:21:48 2026
++++ /usr/src/sbin/ifconfig/ifconfig.c	Tue Oct 20 09:21:48 2026
+@@ -82,6 +82,7 @@
+ #include <net/if_pflow.h>
  #include <net/if_pppoe.h>
  #include <net/if_trunk.h>
- #include <net/if_wg.h>
 +#include <net/if_awg.h>
- #include <net/trunklacp.h>
+ #include <net/if_wg.h>
  #include <net/if_sppp.h>
  #include <net/ppp_defs.h>
-@@ -366,6 +367,52 @@
+@@ -365,6 +366,52 @@
  void	unsetwgpeerall(const char *, int);
  
  void	wg_status(int);
@@ -61,7 +61,7 @@
  #else
  void	setignore(const char *, int);
  #endif
-@@ -394,6 +441,7 @@
+@@ -393,6 +440,7 @@
  #define	A_MEDIAMODE	0x0010		/* mode command */
  #define	A_JOIN		0x0020		/* join */
  #define	A_WIREGUARD	0x0040		/* any WireGuard command */
@@ -69,7 +69,7 @@
  #define A_SILENT	0x8000000	/* doing operation, do not print */
  
  #define	NEXTARG0	0xffffff
-@@ -657,6 +705,51 @@
+@@ -656,6 +704,51 @@
  	{ "-wgdescr",	0,		A_WIREGUARD,	unsetwgpeerdesc},
  	{ "-wgpeerall",	0,		A_WIREGUARD,	unsetwgpeerall},
  
@@ -121,7 +121,7 @@
  #else /* SMALL */
  	{ "powersave",	NEXTARG0,	0,		setignore },
  	{ "priority",	NEXTARG,	0,		setignore },
-@@ -730,6 +823,7 @@
+@@ -729,6 +822,7 @@
  void	process_join_commands(void);
  
  void	process_wg_commands(void);
@@ -129,7 +129,7 @@
  
  void	in_status(int);
  void	in_getaddr(const char *, int);
-@@ -980,6 +1074,7 @@
+@@ -979,6 +1073,7 @@
  
  #ifndef SMALL
  	process_wg_commands();
@@ -137,7 +137,7 @@
  #endif
  
  	process_join_commands();
-@@ -3410,6 +3505,7 @@
+@@ -3409,6 +3504,7 @@
  	pflow_status();
  	umb_status();
  	wg_status(ifaliases);
@@ -145,7 +145,7 @@
  #endif
  	trunk_status();
  	getifgroups();
-@@ -6057,6 +6153,669 @@
+@@ -6056,6 +6152,669 @@
  	free(wgdata.wgd_interface);
  }
  

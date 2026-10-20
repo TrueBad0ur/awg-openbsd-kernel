@@ -1,6 +1,6 @@
 # AmneziaWG for OpenBSD
 
-Native kernel driver (`awg(4)`) for [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) — an obfuscated WireGuard fork — on OpenBSD 7.x amd64.
+Native kernel driver (`awg(4)`) for [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module) — an obfuscated WireGuard fork — on OpenBSD 7.x and 8.x amd64.
 
 OpenBSD ships WireGuard (`wg(4)`) built into GENERIC. This project adds a parallel `awg(4)` pseudo-device to a custom kernel, providing the AmneziaWG obfuscation that is used on Linux and Windows, without any userspace daemon.
 
@@ -27,7 +27,7 @@ Interfaces are named `awg0`, `awg1`, … Configs live in `/etc/amnezia/amneziawg
 
 ## Requirements
 
-- OpenBSD 7.x amd64
+- OpenBSD 7.x or 8.x amd64 (tested on 8.0; builds on 7.9)
 - Root access
 - Packages: `bash` — `install.sh` installs it automatically
 - Kernel sources and ifconfig sources — downloaded from the OpenBSD CDN automatically if missing
@@ -49,6 +49,8 @@ doas sh install.sh --all
 ```
 
 After `--kernel-only` or `--all`, reboot. The bootloader loads `/bsd` automatically.
+
+> **After `sysupgrade`:** the upgrade installs a stock `GENERIC.MP` kernel and stock `ifconfig`, so `awg(4)` is gone until you reinstall. Move the old release's sources aside (`/usr/src/sys`, `/usr/src/sbin/ifconfig`), run `install.sh --all` (it fetches sources matching `uname -r`) and reboot. `install.sh` refuses to build from sources of another release.
 
 > **Upgrading from a release without AWG 3.1 support:** the ioctl interface between the kernel and `ifconfig(8)` changed, so rebuild both (`install.sh --all`) and reboot. Until the reboot, the new `ifconfig` cannot configure the running old kernel (and an old `ifconfig` cannot configure the new kernel): `SIOCSAWG` fails with `Inappropriate ioctl for device`.
 
@@ -306,16 +308,16 @@ The 3.1 mode also talks to AmneziaWG 2.x peers (`S3`, `S4`, `H1`–`H4` ranges, 
 
 ## Performance
 
-Loopback benchmark: two interfaces in separate rdomains on the same machine, tunnel over 127.0.0.1, iperf3 (TCP) through the tunnel, 8 s per run, three runs each. OpenBSD 7.9 VM, 4 vCPU on an AMD Ryzen 7 5800H.
+Loopback benchmark: two interfaces in separate rdomains on the same machine, tunnel over 127.0.0.1, iperf3 (TCP) through the tunnel, 8 s per run, three runs each. OpenBSD 8.0 VM, 4 vCPU on an AMD Ryzen 7 5800H (7.9 gives the same results within run-to-run noise).
 
 | Configuration | 1 stream, Mbit/s | 4 streams, Mbit/s |
 |---|---|---|
-| WireGuard `wg(4)` baseline | 876–948 | 913–923 |
-| AWG legacy, no obfuscation | 854–881 | 834–873 |
-| AWG legacy, Jc=4, S1=26, S2=33, custom H1–H4 | 861–870 | 919–937 |
-| AWG 3.1, all parameters (S1–S4, H ranges, I1/I3, HeaderProtectionKey, ContentPaddingAddition, RandomTrailers, timings) | 809–828 | 852–869 |
+| WireGuard `wg(4)` baseline | 897–910 | 907–939 |
+| AWG legacy, no obfuscation | 882–900 | 856–905 |
+| AWG legacy, Jc=4, S1=26, S2=33, custom H1–H4 | 946–989 | 925–954 |
+| AWG 3.1, all parameters (S1–S4, H ranges, I1/I3, HeaderProtectionKey, ContentPaddingAddition, RandomTrailers, timings) | 795–817 | 804–846 |
 
-**Legacy obfuscation costs nothing measurable on the data path**: junk packets, prefix bytes and magic headers only affect handshake packets. The 3.1 parameters `S4`, `HeaderProtectionKey`, `ContentPaddingAddition` and `RandomTrailers` touch every data packet and cost roughly 5–7% here. AllowedIPs lookups use an ART (Allotment Routing Table) with O(prefix length) complexity, so the number of entries does not affect throughput or latency.
+**Legacy obfuscation costs nothing measurable on the data path**: junk packets, prefix bytes and magic headers only affect handshake packets. The 3.1 parameters `S4`, `HeaderProtectionKey`, `ContentPaddingAddition` and `RandomTrailers` touch every data packet and cost roughly 10% here. AllowedIPs lookups use an ART (Allotment Routing Table) with O(prefix length) complexity, so the number of entries does not affect throughput or latency.
 
 Real-world throughput is limited by the peer's bandwidth and RTT, not the driver.
 
