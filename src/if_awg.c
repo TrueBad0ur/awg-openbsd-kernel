@@ -80,6 +80,10 @@
 #define UNDERLOAD_TIMEOUT	1
 
 #define AWG_DEFAULT_UDP_WINDOW	500	/* initial peer UDP window, 3.1 */
+#define AWG_MAX_UDP_WINDOW	1500	/* clamp: largest payload a tunnel MTU carries */
+#define AWG_MAX_PADDING		1280	/* S1-S4/S3/S4 upper bound (min IPv6 MTU) */
+#define AWG_MAX_JUNK		64	/* Jc upper bound; upstream recommends 4-12 */
+#define AWG_MAX_JUNK_SIZE	1500	/* junk packets are built in a 1500-byte buffer */
 #define AWG_MAX_UDP_PAYLOAD	65507
 
 #define AWGPRINTF(loglevel, sc, mtx, fmt, ...) do {		\
@@ -996,10 +1000,29 @@ awg_send_buf(struct awg_softc *sc, struct awg_endpoint *e, uint8_t *buf,
 	int		 ret = 0;
 	size_t		 mlen = len + max_hdr;
 
+	/*
+	 * m_clget() panics on requests above MAXMCLBYTES, and m_align()
+	 * asserts that it was given a cluster when the data does not fit in
+	 * the header.  Both are reachable from a configured S1-S4 or from a
+	 * peer that inflated p_udp_window, so refuse instead of panicking.
+	 */
+	if (mlen > MAXMCLBYTES) {
+		AWGPRINTF(LOG_DEBUG, sc, NULL, "awg_send_buf: %zu bytes, too "
+		    "large for a cluster\n", mlen);
+		return;
+	}
+
 retry:
 	m = m_gethdr(M_WAIT, MT_DATA);
-	if (mlen > MHLEN)
+	if (mlen > MHLEN) {
 		MCLGETL(m, M_WAIT, mlen);
+		if (!ISSET(m->m_flags, M_EXT)) {
+			AWGPRINTF(LOG_DEBUG, sc, NULL, "awg_send_buf: no "
+			    "cluster for %zu bytes\n", mlen);
+			m_freem(m);
+			return;
+		}
+	}
 	m_align(m, len);
 	m->m_pkthdr.len = m->m_len = len;
 	memcpy(mtod(m, void *), buf, len);
@@ -1171,6 +1194,13 @@ awg_content_padding(struct awg_softc *sc, uint32_t window, size_t size)
 void
 awg_peer_update_udp_window(struct awg_peer *peer, uint32_t size)
 {
+	/*
+	 * The window bounds the padding added to outgoing packets, so an
+	 * unchained peer could otherwise ask us to emit 64 KB datagrams.
+	 * Clamp it to the largest payload a tunnel MTU can carry.
+	 */
+	if (size > AWG_MAX_UDP_WINDOW)
+		size = AWG_MAX_UDP_WINDOW;
 	/* Racy on purpose, the window only grows and is advisory */
 	if (peer->p_udp_window < size)
 		peer->p_udp_window = size;
@@ -1766,6 +1796,13 @@ awg_send_ispecs(struct awg_softc *sc, struct awg_peer *peer)
 		is = &sc->sc_awg_ispec[i];
 		if (is->is_pkt_len == 0)
 			continue;
+		if (is->is_pkt_len > sc->sc_if.if_mtu) {
+			/* Fragmented signature packets look suspicious */
+			AWGPRINTF(LOG_DEBUG, sc, NULL, "I%zu is %zu bytes, "
+			    "above mtu %u, skipped\n", i + 1,
+			    is->is_pkt_len, sc->sc_if.if_mtu);
+			continue;
+		}
 		if ((buf = malloc(is->is_pkt_len, M_TEMP, M_NOWAIT)) == NULL)
 			break;
 		memcpy(buf, is->is_pkt, is->is_pkt_len);
@@ -3013,6 +3050,36 @@ awg_ioctl_check(struct awg_softc *sc, struct awg_interface_io *io)
 	s[1] = f & AWG_INTERFACE_HAS_S12 ? io->i_s2 : sc->sc_awg_s2;
 	s[2] = f & AWG_INTERFACE_HAS_S3 ? io->i_s3 : sc->sc_awg_s3;
 	s[3] = f & AWG_INTERFACE_HAS_S4 ? io->i_s4 : sc->sc_awg_s4;
+	/*
+	 * The prefixes are prepended to a packet whose cluster is allocated
+	 * as padding + header; m_clget() panics above MAXMCLBYTES, so a
+	 * configuration value must never be able to reach it.
+	 */
+	for (i = 0; i < 4; i++)
+		if (s[i] > AWG_MAX_PADDING)
+			return EINVAL;
+	if (f & AWG_INTERFACE_HAS_JC && io->i_jc > AWG_MAX_JUNK)
+		return EINVAL;
+	/* Junk is built in a 1500-byte stack buffer; a larger Jmax makes the
+	 * driver send nothing at all, which is worse than refusing it. */
+	if (f & AWG_INTERFACE_HAS_JC && io->i_jmax > AWG_MAX_JUNK_SIZE)
+		return EINVAL;
+	/*
+	 * A keychain that expires before the next handshake can complete
+	 * rekeys on every packet. Only check when both values arrive in the
+	 * same call, the way awg-quick sends them.
+	 */
+	if ((f & (AWG_INTERFACE_HAS_REJECT_AFTER_TIME |
+	    AWG_INTERFACE_HAS_KEEPALIVE_TIMEOUT)) ==
+	    (AWG_INTERFACE_HAS_REJECT_AFTER_TIME |
+	    AWG_INTERFACE_HAS_KEEPALIVE_TIMEOUT)) {
+		int window = io->i_keepalive_timeout.r_hi +
+		    ((f & AWG_INTERFACE_HAS_REKEY_TIMEOUT) ?
+		    io->i_rekey_timeout.r_hi : awg_rekey_timeout(sc));
+		if (!awg_range_is_zero(io->i_reject_after_time) &&
+		    io->i_reject_after_time.r_hi <= window)
+			return EINVAL;
+	}
 	if (f & AWG_INTERFACE_HAS_HPK) {
 		for (has_hpk = 0, i = 0; i < AWG_HPK_LEN; i++)
 			has_hpk |= io->i_hpk[i];
