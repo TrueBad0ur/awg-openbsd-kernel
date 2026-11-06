@@ -164,6 +164,22 @@ install_kernel() {
             || die "conf/files patch failed — if_awg.c entry not found"
     fi
 
+    # if_awg.c calls wg_cookie/blake2s/curve25519/chachapoly. Those entries are
+    # attached to "wg" (or "ipsec | crypto"), so a config with awg but without
+    # wg links with undefined symbols. Attach them to awg as well.
+    if ! grep -q 'wg_cookie\.c.*awg' "$SRCDIR/conf/files"; then
+        log "Attaching shared crypto/cookie files to the awg attribute"
+        awk '
+            $1 == "file" && ($2 == "net/wg_cookie.c" || $2 == "crypto/blake2s.c" ||
+                $2 == "crypto/curve25519.c" || $2 == "crypto/chachapoly.c") &&
+                $0 !~ /awg/ { print $0 " | awg"; next }
+            { print }
+        ' "$SRCDIR/conf/files" > "$SRCDIR/conf/files.tmp" \
+            && mv "$SRCDIR/conf/files.tmp" "$SRCDIR/conf/files"
+        grep -q 'wg_cookie\.c.*awg' "$SRCDIR/conf/files" \
+            || die "conf/files patch failed — wg_cookie.c entry not found"
+    fi
+
     log "Configuring AWG.MP"
     cd "$SRCDIR/arch/amd64/conf"
     config AWG.MP
